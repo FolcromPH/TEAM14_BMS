@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "battery-system-sys",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-27",
+  "dev": {
+    "ip": "0.0.0.0",
+    "port": 8787
+  },
+  "vars": {
+    "BATTERY1_CAPACITY_AH": "10",
+    "BATTERY2_CAPACITY_AH": "2.2",
+    "BATTERY_CAPACITY_AH": "10",
+    "INITIAL_SOC": "100"
+  },
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "battery_management_db",
+      "database_name": "battery-management-db",
+      "database_id": "3e02236d-4d2c-42b3-8967-81260f937c9d",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

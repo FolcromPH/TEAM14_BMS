@@ -1,0 +1,23 @@
+:root {
+  font-family: 'Manrope', sans-serif;
+  color: #24332f;
+  background: #f1f4f2;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-optical-sizing: auto;
+  font-weight: 400;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button { font: inherit; }
+
+#root { min-height: 100vh; }
