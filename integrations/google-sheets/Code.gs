@@ -4,7 +4,9 @@ const HEADERS = [
   'Battery 1 power (W)', 'Battery 1 temperature (C)', 'Battery 1 SOC (%)',
   'Battery 1 SOH (%)', 'Battery 2 INA found', 'Battery 2 voltage (V)',
   'Battery 2 current (A)', 'Battery 2 power (W)', 'Battery 2 temperature (C)',
-  'Battery 2 SOC (%)', 'Battery 2 SOH (%)', 'Brownout detected',
+  'Battery 2 SOC (%)', 'Battery 2 SOH (%)', 'Brownout detected', 'Previous session (legacy)',
+  'Battery 1 Identity ID', 'Battery 1 Name', 'Battery 2 Identity ID', 'Battery 2 Name',
+  'Capture Request ID',
 ];
 
 function doPost(event) {
@@ -27,6 +29,13 @@ function doPost(event) {
     if (sheet.getLastRow() === 0) {
       sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
       sheet.setFrozenRows(1);
+    } else {
+      const existingHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+      for (const header of HEADERS) {
+        if (!existingHeaders.includes(header)) {
+          sheet.getRange(1, HEADERS.indexOf(header) + 1).setValue(header);
+        }
+      }
     }
 
     const readings = Array.isArray(body.readings) ? body.readings : [];
@@ -62,6 +71,12 @@ function doPost(event) {
           battery2.soc ?? '',
           battery2.soh ?? '',
           Boolean(system.brownoutDetected),
+          '',
+          battery1.identityId ?? '',
+          battery1.identityName ?? '',
+          battery2.identityId ?? '',
+          battery2.identityName ?? '',
+          reading.captureRequestId ?? '',
         ];
       });
 

@@ -493,6 +493,31 @@
 .inventory-delete:disabled { cursor: wait; opacity: 0.6; }
 .inventory-message { margin: 13px 0 0; color: #48635a; font-size: 12px; }
 
+.inventory-notification {
+  position: fixed;
+  z-index: 20;
+  right: 20px;
+  bottom: 20px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 30px;
+  align-items: start;
+  gap: 11px;
+  width: min(390px, calc(100vw - 40px));
+  padding: 14px;
+  border: 1px solid #b9d8c6;
+  border-left: 4px solid #23785f;
+  border-radius: 6px;
+  color: #294c3d;
+  background: #f5fbf7;
+  box-shadow: 0 8px 28px rgb(27 43 37 / 18%);
+}
+
+.inventory-notification > svg { margin-top: 1px; color: #23785f; }
+.inventory-notification > div { display: grid; gap: 4px; min-width: 0; }
+.inventory-notification strong { color: #234634; font-size: 13px; }
+.inventory-notification span { color: #526b5d; font-size: 12px; line-height: 1.5; }
+.inventory-notification button { display: grid; width: 30px; height: 30px; place-items: center; border: 0; color: #526b5d; background: transparent; cursor: pointer; }
+
 .confirmation-backdrop {
   position: fixed;
   z-index: 30;

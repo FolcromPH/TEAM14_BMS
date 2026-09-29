@@ -92,7 +92,7 @@ function Metric({ label, value, unit, decimals = 2, emphasis = false }) {
   )
 }
 
-function BatteryPanel({ index, battery, health, system }) {
+function BatteryPanel({ index, battery, health, system, batteryName }) {
   const status = batteryStatus(battery, system, index)
   const hasSignal = battery && Object.values(battery).some((value) => value !== null && value !== undefined)
 
@@ -103,7 +103,7 @@ function BatteryPanel({ index, battery, health, system }) {
           <span className={`battery-symbol battery-symbol-${index}`}><BatteryCharging size={20} /></span>
           <div>
             <p className="eyebrow">ENERGY STORAGE</p>
-            <h2 id={`battery-${index}-title`}>Battery {index}</h2>
+            <h2 id={`battery-${index}-title`}>{batteryName || `Battery ${index}`}</h2>
           </div>
         </div>
         <span className={`status-pill status-${status.toLowerCase()}`}>{status}</span>
@@ -127,14 +127,17 @@ function BatteryPanel({ index, battery, health, system }) {
 function DatabaseReader() {
   const [range, setRange] = useState('24h')
   const [metricKey, setMetricKey] = useState('Power')
-  const [leftSlot, setLeftSlot] = useState('1')
-  const [rightSlot, setRightSlot] = useState('2')
-  const [tableSlot, setTableSlot] = useState('1')
+  const [leftBatteryId, setLeftBatteryId] = useState('')
+  const [rightBatteryId, setRightBatteryId] = useState('')
+  const [tableBatteryId, setTableBatteryId] = useState('')
   const [tableSortMode, setTableSortMode] = useState('latest')
   const [history, setHistory] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [refreshToken, setRefreshToken] = useState(0)
+  const identities = history?.batteryIdentities ?? []
+  const tableIdentity = identities.find((identity) => String(identity.id) === tableBatteryId)
+  const tableSlot = String(tableIdentity?.slot ?? 1)
 
   useEffect(() => {
     let stopped = false
@@ -148,12 +151,18 @@ function DatabaseReader() {
           slot: tableSlot,
           sort: tableSort,
           order: tableOrder,
+          leftBatteryId,
+          rightBatteryId,
+          batteryId: tableBatteryId,
         })
         const response = await fetch(`/api/readings?${params}`)
         const result = await response.json()
         if (!response.ok) throw new Error(result.error || 'Could not read database history')
         if (stopped) return
         setHistory(result)
+        setLeftBatteryId((current) => current || String(result.selectedIdentityIds.left || ''))
+        setRightBatteryId((current) => current || String(result.selectedIdentityIds.right || ''))
+        setTableBatteryId((current) => current || String(result.selectedBatteryId || ''))
         setError('')
       } catch (requestError) {
         if (stopped) return
@@ -169,13 +178,17 @@ function DatabaseReader() {
       stopped = true
       window.clearInterval(interval)
     }
-  }, [range, refreshToken, tableSlot, tableSortMode, metricKey])
+  }, [range, refreshToken, tableBatteryId, tableSlot, tableSortMode, metricKey, leftBatteryId, rightBatteryId])
 
-  const latest = history?.readings?.[0]
   const metric = HISTORY_METRICS.find((item) => item.key === metricKey) ?? HISTORY_METRICS[0]
   const sampleCount = history?.series?.reduce((total, point) => total + point.samples, 0) ?? 0
-  const batteryNames = Object.fromEntries((history?.batteries ?? []).map((battery) => [battery.slot, battery.name]))
-  const graphSlotIndices = [Number(leftSlot), Number(rightSlot)]
+  const latest = history?.readings?.[0]
+  const leftIdentity = identities.find((identity) => String(identity.id) === leftBatteryId)
+  const rightIdentity = identities.find((identity) => String(identity.id) === rightBatteryId)
+  const graphSelections = [
+    { side: 'left', identity: leftIdentity, history: history?.identitySeries?.left },
+    { side: 'right', identity: rightIdentity, history: history?.identitySeries?.right },
+  ]
   const tableSortLabel = tableSortMode === 'latest'
     ? 'Latest readings'
     : `${tableSortMode === 'highest' ? 'Highest' : 'Lowest'} ${metric.label.toLowerCase()}`
@@ -224,14 +237,14 @@ function DatabaseReader() {
         </div>
         <label className="history-select-field">
           <span>Left graph</span>
-          <select className="battery-history-filter" value={leftSlot} onChange={(event) => setLeftSlot(event.target.value)}>
-            {[1, 2].map((slot) => <option value={slot} key={slot}>{batteryNames[slot] || `Battery ${slot}`}</option>)}
+          <select className="battery-history-filter" value={leftBatteryId} onChange={(event) => setLeftBatteryId(event.target.value)}>
+            {identities.map((identity) => <option value={identity.id} key={identity.id}>{identity.name}{identity.active ? ` · Slot ${identity.slot}` : ` · Previous #${identity.id}`}</option>)}
           </select>
         </label>
         <label className="history-select-field">
           <span>Right graph</span>
-          <select className="battery-history-filter" value={rightSlot} onChange={(event) => setRightSlot(event.target.value)}>
-            {[1, 2].map((slot) => <option value={slot} key={slot}>{batteryNames[slot] || `Battery ${slot}`}</option>)}
+          <select className="battery-history-filter" value={rightBatteryId} onChange={(event) => setRightBatteryId(event.target.value)}>
+            {identities.map((identity) => <option value={identity.id} key={identity.id}>{identity.name}{identity.active ? ` · Slot ${identity.slot}` : ` · Previous #${identity.id}`}</option>)}
           </select>
         </label>
         <button
@@ -257,15 +270,15 @@ function DatabaseReader() {
 
       <Suspense fallback={<div className="history-graphs-loading">Loading graphs...</div>}>
         <div className="history-battery-grid">
-          {graphSlotIndices.map((index, graphIndex) => (
+          {graphSelections.map(({ side, identity, history: identityHistory }, graphIndex) => (
             <HistoryBatteryPanel
-              index={index}
-              key={`${graphIndex}-${index}`}
-              latest={latest}
-              series={history?.series ?? []}
+              index={graphIndex + 1}
+              key={`${side}-${identity?.id ?? 'empty'}`}
+              latest={identityHistory?.latest}
+              series={identityHistory?.series ?? []}
               metric={metric}
               range={range}
-              batteryName={batteryNames[index] || `Battery ${index}`}
+              batteryName={identity?.name ?? 'Select a battery'}
             />
           ))}
         </div>
@@ -274,14 +287,14 @@ function DatabaseReader() {
       <section className="reading-table-section" aria-labelledby="reading-table-title">
         <div className="reading-table-heading">
           <div>
-            <h3 id="reading-table-title">{batteryNames[tableSlot] || `Battery ${tableSlot}`} · {tableSortLabel}</h3>
+            <h3 id="reading-table-title">{tableIdentity?.name || 'Battery'} · {tableSortLabel}</h3>
             <span>{tableSortMode === 'latest' ? 'Newest values in selected range' : `Sorted by ${metric.label.toLowerCase()} across selected range`}</span>
           </div>
           <div className="reading-table-controls">
             <label className="history-select-field">
               <span>Battery</span>
-              <select className="battery-history-filter" value={tableSlot} onChange={(event) => setTableSlot(event.target.value)}>
-                {[1, 2].map((slot) => <option value={slot} key={slot}>{batteryNames[slot] || `Battery ${slot}`}</option>)}
+              <select className="battery-history-filter" value={tableBatteryId} onChange={(event) => setTableBatteryId(event.target.value)}>
+                {identities.map((identity) => <option value={identity.id} key={identity.id}>{identity.name}{identity.active ? ` · Slot ${identity.slot}` : ` · Previous #${identity.id}`}</option>)}
               </select>
             </label>
             <label className="history-select-field">
@@ -299,6 +312,8 @@ function DatabaseReader() {
             <thead>
               <tr>
                 <th scope="col">Time</th>
+                <th scope="col">Battery</th>
+                <th scope="col">Capture</th>
                 <th scope="col">Mode</th>
                 <th scope="col">Voltage</th>
                 <th scope="col">Current</th>
@@ -310,6 +325,8 @@ function DatabaseReader() {
               {history?.readings?.length ? history.readings.map((item) => (
                 <tr key={item.id}>
                   <td>{new Date(item.timestamp).toLocaleString()}</td>
+                  <td>{item[`battery${tableSlot}`].identityName || '--'}</td>
+                  <td>{item.captureRequestId ? 'Requested' : '--'}</td>
                   <td>{item.mode || '--'}</td>
                   <td>{formatValue(item[`battery${tableSlot}`].voltage)}</td>
                   <td>{formatValue(item[`battery${tableSlot}`].current)}</td>
@@ -317,7 +334,7 @@ function DatabaseReader() {
                   <td>{formatValue(item[`battery${tableSlot}`].temperature, 1)}</td>
                 </tr>
               )) : (
-                <tr><td className="reading-table-empty" colSpan={6}>No stored readings in this time range</td></tr>
+                <tr><td className="reading-table-empty" colSpan={8}>No stored readings in this time range</td></tr>
               )}
             </tbody>
           </table>
@@ -329,6 +346,7 @@ function DatabaseReader() {
 
 function App() {
   const [reading, setReading] = useState(null)
+  const [batterySpecs, setBatterySpecs] = useState([])
   const [health, setHealth] = useState(null)
   const [connection, setConnection] = useState('connecting')
   const [lastUpdate, setLastUpdate] = useState(null)
@@ -354,6 +372,7 @@ function App() {
         ])
 
         if (stopped) return
+        setBatterySpecs(readingResult.batteries ?? [])
         setHealth(healthResult)
         if (!readingResponse.ok || !readingResult.connected) {
           setReading(null)
@@ -520,8 +539,20 @@ function App() {
         </div>
 
         <div className="battery-grid">
-          <BatteryPanel index={1} battery={reading?.battery1} health={health?.battery1} system={reading} />
-          <BatteryPanel index={2} battery={reading?.battery2} health={health?.battery2} system={reading} />
+          <BatteryPanel
+            index={1}
+            battery={reading?.battery1}
+            health={health?.battery1}
+            system={reading}
+            batteryName={reading?.battery1?.identityName || batterySpecs.find((battery) => battery.slot === 1)?.name}
+          />
+          <BatteryPanel
+            index={2}
+            battery={reading?.battery2}
+            health={health?.battery2}
+            system={reading}
+            batteryName={reading?.battery2?.identityName || batterySpecs.find((battery) => battery.slot === 2)?.name}
+          />
         </div>
 
         <section className="control-section" aria-labelledby="control-title">

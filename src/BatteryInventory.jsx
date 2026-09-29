@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { BatteryCharging, Plus, Save, Trash2 } from 'lucide-react'
+import { BatteryCharging, CheckCircle2, ClipboardPlus, Plus, Save, Trash2, X } from 'lucide-react'
 import './App.css'
 
 const SLOTS = [1, 2]
@@ -18,6 +18,8 @@ export default function BatteryInventory() {
   const [batteries, setBatteries] = useState({})
   const [loading, setLoading] = useState(true)
   const [savingSlot, setSavingSlot] = useState(null)
+  const [creatingReading, setCreatingReading] = useState(false)
+  const [notification, setNotification] = useState(null)
   const [message, setMessage] = useState('')
   const [pendingDelete, setPendingDelete] = useState(null)
   const [confirmText, setConfirmText] = useState('')
@@ -103,11 +105,31 @@ export default function BatteryInventory() {
       const result = await response.json()
       if (!response.ok || !result.success) throw new Error(result.error || 'Could not save battery')
       await loadBatteries()
-      setMessage(`${result.battery.name} saved`)
+      setMessage(result.createdIdentity
+        ? `${result.battery.name} saved as a new battery identity. Older readings remain in history.`
+        : `${result.battery.name} saved`)
     } catch (error) {
       setMessage(error.message || 'Could not save battery')
     } finally {
       setSavingSlot(null)
+    }
+  }
+
+  async function createReading() {
+    setCreatingReading(true)
+    setMessage('')
+    try {
+      const response = await fetch('/api/reading-captures', { method: 'POST' })
+      const result = await response.json()
+      if (!response.ok || !result.success) throw new Error(result.error || 'Could not request a new reading')
+      setNotification({
+        title: 'Reading request successful',
+        body: 'Waiting for the system to turn on. The next fresh reading will be saved to battery history.',
+      })
+    } catch (error) {
+      setMessage(error.message || 'Could not request a new reading')
+    } finally {
+      setCreatingReading(false)
     }
   }
 
@@ -131,7 +153,7 @@ export default function BatteryInventory() {
       })
       setPendingDelete(null)
       setConfirmText('')
-      setMessage(`${name} and its D1 measurements were deleted`)
+      setMessage(`${name} removed from the active slot. Its saved history remains available.`)
     } catch (error) {
       setMessage(error.message || 'Could not delete battery')
     } finally {
@@ -149,18 +171,10 @@ export default function BatteryInventory() {
         <button
           className="inventory-add-button"
           type="button"
-          onClick={() => {
-            const slot = SLOTS.find((item) => !batteries[item])
-            if (!slot) {
-              setMessage('Both INA260 slots already have batteries. Remove one before adding a replacement.')
-              return
-            }
-            const form = document.getElementById(`battery-slot-${slot}`)
-            form?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-            form?.querySelector('input')?.focus({ preventScroll: true })
-          }}
+          onClick={createReading}
+          disabled={creatingReading}
         >
-          <Plus size={16} />Add battery
+          <ClipboardPlus size={16} />{creatingReading ? 'Creating...' : 'New reading'}
         </button>
       </div>
 
@@ -265,7 +279,20 @@ export default function BatteryInventory() {
         })}
       </div>
       {message && <p className="inventory-message" role="status">{message}</p>}
-      <p className="analytics-method-note">Capacity can be entered in Ah or mAh. Removing a battery also removes its historical D1 readings; the other battery&apos;s data remains. Previously synced Google Sheets rows are not removed.</p>
+      <p className="analytics-method-note">Changing a battery name and saving starts a new identity for that sensor slot. Earlier readings stay linked to the previous battery. Capacity can be entered in Ah or mAh.</p>
+
+      {notification && (
+        <div className="inventory-notification" role="status">
+          <CheckCircle2 size={19} />
+          <div>
+            <strong>{notification.title}</strong>
+            <span>{notification.body}</span>
+          </div>
+          <button type="button" aria-label="Dismiss notification" onClick={() => setNotification(null)}>
+            <X size={17} />
+          </button>
+        </div>
+      )}
 
       {pendingDelete && (
         <div className="confirmation-backdrop">
@@ -279,7 +306,7 @@ export default function BatteryInventory() {
             <p className="eyebrow">PERMANENT DATABASE CHANGE</p>
             <h3 id="delete-battery-title">You are about to delete {pendingDelete.name}</h3>
             <p id="delete-battery-description">
-              This removes {pendingDelete.name}&apos;s specifications and saved D1 readings. The other battery&apos;s data stays. Previously synced Google Sheets rows are not removed.
+              This removes {pendingDelete.name} from the active sensor slot. Its saved D1 readings remain available under its battery identity.
             </p>
             <label className="inventory-field confirmation-field">
               <span>Type <strong>{pendingDelete.name}</strong> to confirm</span>
@@ -293,7 +320,7 @@ export default function BatteryInventory() {
                 disabled={confirmText !== pendingDelete.name || savingSlot !== null}
                 onClick={confirmDelete}
               >
-                {savingSlot === pendingDelete.slot ? 'Deleting...' : 'Delete battery and readings'}
+                {savingSlot === pendingDelete.slot ? 'Removing...' : 'Remove from active slot'}
               </button>
             </div>
           </section>

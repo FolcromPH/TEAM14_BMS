@@ -27,8 +27,8 @@ function Metric({ label, value, unit, decimals = 2 }) {
 }
 
 export default function HistoryBatteryPanel({ index, latest, series, metric, range, batteryName }) {
-  const battery = latest?.[`battery${index}`]
-  const dataKey = `battery${index}${metric.key}`
+  const battery = latest
+  const dataKey = metric.key.toLowerCase()
   const color = index === 1 ? '#23785f' : '#b06c29'
   const status = battery?.connected === true
     ? 'ONLINE'

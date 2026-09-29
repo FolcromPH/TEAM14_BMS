@@ -23,9 +23,9 @@ function AnalyticsMetric({ label, value, unit, detail }) {
   )
 }
 
-export default function AnalyticsBatteryPanel({ index, batteryName, analytics, series, ratedCapacityAh }) {
+export default function AnalyticsBatteryPanel({ index, batterySlot, batteryName, analytics, series, ratedCapacityAh }) {
   const color = index === 1 ? '#23785f' : '#b06c29'
-  const socKey = `battery${index}Soc`
+  const socKey = `battery${batterySlot}Soc`
   const hasSocSamples = series.some((point) => Number.isFinite(point[socKey]))
   const hasSohForecast = analytics.predictedSohDropNextCycle !== null
   const nextSoh = hasSohForecast && analytics.latestSoh !== null
@@ -51,7 +51,7 @@ export default function AnalyticsBatteryPanel({ index, batteryName, analytics, s
           value={format(analytics.averageDischargeA)}
           unit=" A"
           detail={hasSocSamples
-            ? index === 1 ? 'System battery · all modes' : 'While Battery 1 is charging'
+            ? batterySlot === 1 ? 'System battery · all modes' : 'While Battery 1 is charging'
             : 'No connected-sensor samples'}
         />
         <AnalyticsMetric

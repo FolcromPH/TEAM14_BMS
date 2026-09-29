@@ -1,6 +1,6 @@
 # Google Sheets sync
 
-The Worker batches D1 telemetry into a Google Sheet once per minute. It retries unsent rows on later runs and starts with the oldest D1 reading, so existing database history is backfilled too. The `Readings` sheet keeps Battery 1 and Battery 2 values in separate columns.
+The Worker batches D1 telemetry into a Google Sheet once per minute. It retries unsent rows on later runs and starts with the oldest D1 reading, so existing database history is backfilled too. The `Readings` sheet keeps the two INA260 slots in separate columns and includes each sample's battery identity ID and saved name. Renaming a battery creates a new identity, so replacement batteries remain distinguishable in history and comparisons.
 
 ## 1. Create the Apps Script endpoint
 
@@ -10,6 +10,8 @@ The Worker batches D1 telemetry into a Google Sheet once per minute. It retries 
    - `SPREADSHEET_ID`: the spreadsheet ID from step 1.
    - `SYNC_TOKEN`: a long random token. Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
 4. Choose **Deploy > New deployment > Web app**. Set **Execute as** to yourself and access to **Anyone**, then deploy and copy the web app URL ending in `/exec`.
+
+After updating an existing integration, deploy a new Apps Script version so the `Readings` sheet gains the battery identity columns.
 
 The endpoint must be accessible to the Worker. The random shared token is checked by the script; do not put it in the spreadsheet or commit it to source control.
 

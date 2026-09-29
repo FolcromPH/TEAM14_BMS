@@ -95,7 +95,8 @@ function json(data, status = 200) {
 
 async function getLatestReading(db) {
   return db.prepare(`
-    SELECT timestamp_ms, mode, switching, wifi_json, system_json,
+        SELECT id, battery1_identity_id, battery2_identity_id,
+          timestamp_ms, mode, switching, wifi_json, system_json,
            battery1_json, battery2_json,
            battery1_soc, battery2_soc, battery1_soh, battery2_soh
     FROM readings
@@ -106,11 +107,78 @@ async function getLatestReading(db) {
 
 async function getBatterySpecs(db) {
   const result = await db.prepare(`
-    SELECT slot, name, voltage_v, capacity_mah, updated_at_ms
+    SELECT slot, name, voltage_v, capacity_mah, updated_at_ms, identity_id
     FROM battery_specs
     ORDER BY slot
   `).all();
   return Object.fromEntries(result.results.map((battery) => [battery.slot, battery]));
+}
+
+async function getBatteryIdentities(db) {
+  const [identities, currentBatteries] = await Promise.all([
+    db.prepare(`
+      SELECT id, slot, name, voltage_v, capacity_mah, created_at_ms
+      FROM battery_identities
+      ORDER BY created_at_ms DESC, id DESC
+    `).all(),
+    getBatterySpecs(db),
+  ]);
+  return identities.results.map((identity) => ({
+    ...identity,
+    active: currentBatteries[identity.slot]?.identity_id === identity.id,
+  }));
+}
+
+async function readBatteryIdentityHistory(db, identity, startMs, bucketMs) {
+  if (!identity) return { series: [], latest: null };
+  const slot = identity.slot;
+  const identityColumn = `battery${slot}_identity_id`;
+  const batteryColumn = `battery${slot}_json`;
+  const socColumn = `battery${slot}_soc`;
+  const sohColumn = `battery${slot}_soh`;
+  const [seriesResult, latest] = await Promise.all([
+    db.prepare(`
+      SELECT CAST(timestamp_ms / ? AS INTEGER) * ? AS timestamp_ms,
+             AVG(json_extract(${batteryColumn}, '$.power')) AS power,
+             AVG(json_extract(${batteryColumn}, '$.current')) AS current,
+             AVG(json_extract(${batteryColumn}, '$.voltage')) AS voltage,
+             AVG(json_extract(${batteryColumn}, '$.temperature')) AS temperature,
+             AVG(${socColumn}) AS soc
+      FROM readings
+      WHERE timestamp_ms >= ? AND ${identityColumn} = ?
+      GROUP BY CAST(timestamp_ms / ? AS INTEGER)
+      ORDER BY timestamp_ms ASC
+    `).bind(
+      bucketMs,
+      bucketMs,
+      startMs,
+      identity.id,
+      bucketMs,
+    ).all(),
+    db.prepare(`
+      SELECT timestamp_ms, mode, ${batteryColumn} AS battery_json,
+             ${socColumn} AS battery_soc, ${sohColumn} AS battery_soh
+      FROM readings
+      WHERE timestamp_ms >= ? AND ${identityColumn} = ?
+      ORDER BY timestamp_ms DESC
+      LIMIT 1
+    `).bind(startMs, identity.id).first(),
+  ]);
+  return {
+    series: seriesResult.results.map((point) => ({
+      timestamp_ms: Number(point.timestamp_ms),
+      power: number(point.power),
+      current: number(point.current),
+      voltage: number(point.voltage),
+      temperature: number(point.temperature),
+      soc: number(point.soc),
+    })),
+    latest: latest ? {
+      timestamp: latest.timestamp_ms,
+      mode: latest.mode,
+      ...batteryWithHealth(latest.battery_json, latest.battery_soc, latest.battery_soh),
+    } : null,
+  };
 }
 
 async function readBatteries(env) {
@@ -134,17 +202,40 @@ async function saveBattery(request, env) {
     if (voltageV === null || voltageV <= 0 || voltageV > 1000) return json({ error: 'Voltage must be greater than 0 and at most 1000 V' }, 400);
     if (capacityMah === null || capacityMah <= 0 || capacityMah > 1000000) return json({ error: 'Capacity must be greater than 0 and at most 1,000,000 mAh' }, 400);
 
-    await env.battery_management_db.prepare(`
-      INSERT INTO battery_specs (slot, name, voltage_v, capacity_mah, updated_at_ms)
-      VALUES (?, ?, ?, ?, ?)
+    const db = env.battery_management_db;
+    const currentBattery = (await getBatterySpecs(db))[slot];
+    let identityId = currentBattery?.identity_id;
+    const createdIdentity = !currentBattery || currentBattery.name !== name || !identityId;
+    if (createdIdentity) {
+      const identity = await db.prepare(`
+        INSERT INTO battery_identities (slot, name, voltage_v, capacity_mah, created_at_ms)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(slot, name, voltageV, capacityMah, Date.now()).run();
+      identityId = identity.meta.last_row_id;
+    } else {
+      await db.prepare(`
+        UPDATE battery_identities
+        SET voltage_v = ?, capacity_mah = ?
+        WHERE id = ?
+      `).bind(voltageV, capacityMah, identityId).run();
+    }
+
+    await db.prepare(`
+      INSERT INTO battery_specs (slot, name, voltage_v, capacity_mah, updated_at_ms, identity_id)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(slot) DO UPDATE SET
         name = excluded.name,
         voltage_v = excluded.voltage_v,
         capacity_mah = excluded.capacity_mah,
-        updated_at_ms = excluded.updated_at_ms
-    `).bind(slot, name, voltageV, capacityMah, Date.now()).run();
+        updated_at_ms = excluded.updated_at_ms,
+        identity_id = excluded.identity_id
+    `).bind(slot, name, voltageV, capacityMah, Date.now(), identityId).run();
 
-    return json({ success: true, battery: { slot, name, voltage_v: voltageV, capacity_mah: capacityMah } });
+    return json({
+      success: true,
+      createdIdentity,
+      battery: { slot, name, voltage_v: voltageV, capacity_mah: capacityMah, identity_id: identityId },
+    });
   } catch (error) {
     return json({ error: error.message || 'Could not save battery specifications' }, 400);
   }
@@ -161,14 +252,8 @@ async function deleteBattery(request, env, slot) {
       return json({ error: `Type "${battery.name}" exactly to confirm deletion` }, 400);
     }
 
-    const readingsUpdate = slot === 1
-      ? `UPDATE readings SET battery1_json = '{}', battery1_soc = NULL, battery1_soh = NULL`
-      : `UPDATE readings SET battery2_json = '{}', battery2_soc = NULL, battery2_soh = NULL`;
-    await env.battery_management_db.batch([
-      env.battery_management_db.prepare(readingsUpdate),
-      env.battery_management_db.prepare('DELETE FROM battery_specs WHERE slot = ?').bind(slot),
-    ]);
-    return json({ success: true, deletedBattery: battery.name, readingsDeleted: true });
+    await env.battery_management_db.prepare('DELETE FROM battery_specs WHERE slot = ?').bind(slot).run();
+    return json({ success: true, deletedBattery: battery.name, readingsDeleted: false });
   } catch (error) {
     return json({ error: error.message || 'Could not delete battery specifications' }, 500);
   }
@@ -184,7 +269,23 @@ async function readHistory(request, env) {
     };
     const range = new URL(request.url).searchParams.get('range');
     const searchParams = new URL(request.url).searchParams;
-    const tableSlot = searchParams.get('slot') === '2' ? 2 : 1;
+    const requestedTableSlot = searchParams.get('slot') === '2' ? 2 : 1;
+    const db = env.battery_management_db;
+    const identities = await getBatteryIdentities(db);
+    const activeIdentity = (slot) => identities.find((identity) => identity.active && identity.slot === slot);
+    const chooseIdentity = (parameter, slot) => {
+      const requestedId = Number(searchParams.get(parameter));
+      return identities.find((identity) => identity.id === requestedId) || activeIdentity(slot) || null;
+    };
+    const leftIdentity = chooseIdentity('leftBatteryId', 1);
+    const rightIdentity = chooseIdentity('rightBatteryId', 2);
+    const requestedTableBatteryId = Number(searchParams.get('batteryId'));
+    const tableIdentity = identities.find((identity) => identity.id === requestedTableBatteryId)
+      || activeIdentity(requestedTableSlot)
+      || identities[0]
+      || null;
+    const tableSlot = tableIdentity?.slot ?? requestedTableSlot;
+    const tableIdentityFilter = tableIdentity ? ` AND battery${tableSlot}_identity_id = ?` : '';
     const sortBy = ['latest', 'voltage', 'current', 'power', 'temperature', 'soc']
       .includes(searchParams.get('sort')) ? searchParams.get('sort') : 'latest';
     const sortOrder = searchParams.get('order') === 'asc' ? 'ASC' : 'DESC';
@@ -199,8 +300,7 @@ async function readHistory(request, env) {
     const rangeMs = ranges[range] ?? ranges['24h'];
     const bucketMs = Math.max(5000, Math.ceil(rangeMs / (1200 * 5000)) * 5000);
     const startMs = Date.now() - rangeMs;
-    const db = env.battery_management_db;
-    const [seriesResult, readingsResult, batterySpecs] = await Promise.all([
+    const [seriesResult, readingsResult, batterySpecs, leftIdentityHistory, rightIdentityHistory] = await Promise.all([
       db.prepare(`
         SELECT CAST(timestamp_ms / ? AS INTEGER) * ? AS timestamp_ms,
                COUNT(*) AS samples,
@@ -231,22 +331,34 @@ async function readHistory(request, env) {
                          json_extract(battery2_json, '$.soc')) END) AS battery2ReportedSoc,
                  MAX(CASE WHEN json_extract(battery2_json, '$.connected') = 1 THEN 1 ELSE 0 END) AS battery2Connected
         FROM readings
-        WHERE timestamp_ms >= ?
+        WHERE timestamp_ms >= ?${tableIdentityFilter}
         GROUP BY CAST(timestamp_ms / ? AS INTEGER)
         ORDER BY 1 ASC
-      `).bind(bucketMs, bucketMs, startMs, bucketMs).all(),
+      `).bind(
+        bucketMs,
+        bucketMs,
+        startMs,
+        ...(tableIdentity ? [tableIdentity.id] : []),
+        bucketMs,
+      ).all(),
       db.prepare(`
-        SELECT id, timestamp_ms, mode, switching, wifi_json, system_json,
+         SELECT id, capture_request_id, battery1_identity_id, battery2_identity_id,
+           timestamp_ms, mode, switching, wifi_json, system_json,
                battery1_json, battery2_json, battery1_soc, battery2_soc,
                battery1_soh, battery2_soh
         FROM readings
-        WHERE timestamp_ms >= ?
+        WHERE timestamp_ms >= ?${tableIdentityFilter}
         ORDER BY ${sortBy === 'latest'
           ? 'timestamp_ms DESC'
           : `${sortColumns[sortBy]} IS NULL ASC, ${sortColumns[sortBy]} ${sortOrder}`}, timestamp_ms DESC
         LIMIT 100
-      `).bind(startMs).all(),
+      `).bind(
+        startMs,
+        ...(tableIdentity ? [tableIdentity.id] : []),
+      ).all(),
       getBatterySpecs(db),
+      readBatteryIdentityHistory(db, leftIdentity, startMs, bucketMs),
+      readBatteryIdentityHistory(db, rightIdentity, startMs, bucketMs),
     ]);
     const series = seriesResult.results.map((point) => ({
       ...point,
@@ -261,15 +373,27 @@ async function readHistory(request, env) {
       battery2Connected: point.battery2Connected === 1,
       intervalMs: bucketMs,
     }));
+    const identityNames = Object.fromEntries(identities.map((identity) => [identity.id, identity.name]));
     const readings = readingsResult.results.map((row) => ({
       id: row.id,
+      captureRequestId: row.capture_request_id,
+      battery1IdentityId: row.battery1_identity_id,
+      battery2IdentityId: row.battery2_identity_id,
       timestamp: row.timestamp_ms,
       mode: row.mode,
       switching: Boolean(row.switching),
       wifi: JSON.parse(row.wifi_json || '{}'),
       system: JSON.parse(row.system_json || '{}'),
-      battery1: batteryWithHealth(row.battery1_json, row.battery1_soc, row.battery1_soh),
-      battery2: batteryWithHealth(row.battery2_json, row.battery2_soc, row.battery2_soh),
+      battery1: {
+        ...batteryWithHealth(row.battery1_json, row.battery1_soc, row.battery1_soh),
+        identityId: row.battery1_identity_id,
+        identityName: identityNames[row.battery1_identity_id] || '',
+      },
+      battery2: {
+        ...batteryWithHealth(row.battery2_json, row.battery2_soc, row.battery2_soh),
+        identityId: row.battery2_identity_id,
+        identityName: identityNames[row.battery2_identity_id] || '',
+      },
     }));
     recalculateSocForCapacity(series, 1, capacityForBattery(env, 1, batterySpecs));
     recalculateSocForCapacity(series, 2, capacityForBattery(env, 2, batterySpecs));
@@ -279,10 +403,20 @@ async function readHistory(request, env) {
       tableSlot,
       tableSort: sortBy,
       tableOrder: sortOrder.toLowerCase(),
+      selectedBatteryId: tableIdentity?.id ?? null,
+      selectedIdentityIds: {
+        left: leftIdentity?.id ?? null,
+        right: rightIdentity?.id ?? null,
+      },
+      identitySeries: {
+        left: leftIdentityHistory,
+        right: rightIdentityHistory,
+      },
       intervalMs: bucketMs,
       series,
       readings,
       batteries: Object.values(batterySpecs),
+      batteryIdentities: identities,
       googleSheetsConfigured: Boolean(env.GOOGLE_SHEETS_WEBHOOK_URL && env.GOOGLE_SHEETS_SYNC_TOKEN),
     });
   } catch (error) {
@@ -447,108 +581,124 @@ function recalculateSocForCapacity(series, index, capacityAh) {
   }
 }
 
+async function readBatteryIdentityAnalytics(db, identity, startMs, bucketMs) {
+  if (!identity) return null;
+  const slot = identity.slot;
+  const batteryColumn = `battery${slot}_json`;
+  const identityColumn = `battery${slot}_identity_id`;
+  const socColumn = `battery${slot}_soc`;
+  const sohColumn = `battery${slot}_soh`;
+  const result = await db.prepare(`
+    WITH recent AS (
+      SELECT timestamp_ms,
+             CAST(timestamp_ms / ? AS INTEGER) AS bucket,
+             mode,
+             ${batteryColumn} AS battery_json,
+             ${socColumn} AS battery_soc,
+             ${sohColumn} AS battery_soh
+      FROM readings
+      WHERE timestamp_ms >= ? AND ${identityColumn} = ?
+    ),
+    bucket_modes AS (
+      SELECT bucket, mode,
+             ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY timestamp_ms DESC) AS row_num
+      FROM recent
+    )
+    SELECT CAST(recent.bucket AS INTEGER) * ? AS timestamp_ms,
+           MAX(CASE WHEN bucket_modes.row_num = 1 THEN recent.mode END) AS mode,
+           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
+               THEN ABS(CAST(json_extract(recent.battery_json, '$.current') AS REAL)) END) AS current_a,
+           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
+               THEN CAST(json_extract(recent.battery_json, '$.current') AS REAL) END) AS net_current_a,
+           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
+               THEN recent.battery_soc END) AS soc,
+           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
+               THEN COALESCE(json_extract(recent.battery_json, '$.soc_kalman'),
+                     json_extract(recent.battery_json, '$.soc_coulomb'),
+                     json_extract(recent.battery_json, '$.soc_ocv'),
+                     json_extract(recent.battery_json, '$.soc')) END) AS reported_soc,
+           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
+               THEN recent.battery_soh END) AS soh,
+           MAX(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1 THEN 1 ELSE 0 END) AS connected
+    FROM recent
+    JOIN bucket_modes ON bucket_modes.bucket = recent.bucket AND bucket_modes.row_num = 1
+    GROUP BY recent.bucket
+    ORDER BY recent.bucket ASC
+  `).bind(bucketMs, startMs, identity.id, bucketMs).all();
+  const series = result.results.map((point) => ({
+    timestamp_ms: Number(point.timestamp_ms),
+    mode: point.mode,
+    [`battery${slot}CurrentA`]: number(point.current_a),
+    [`battery${slot}NetCurrentA`]: number(point.net_current_a),
+    [`battery${slot}Soc`]: number(point.soc),
+    [`battery${slot}ReportedSoc`]: number(point.reported_soc),
+    [`battery${slot}Soh`]: number(point.soh),
+    [`battery${slot}Connected`]: point.connected === 1,
+    intervalMs: bucketMs,
+  }));
+  const ratedCapacityAh = identity.capacity_mah / 1000;
+  recalculateSocForCapacity(series, slot, ratedCapacityAh);
+
+  return {
+    identityId: identity.id,
+    slot,
+    name: identity.name,
+    ratedCapacityAh,
+    sampleCount: series.length,
+    series: series.map((point) => ({
+      timestamp_ms: point.timestamp_ms,
+      mode: point.mode,
+      [`battery${slot}Soc`]: point[`battery${slot}Connected`] ? point[`battery${slot}Soc`] : null,
+      [`battery${slot}DischargeA`]: point[`battery${slot}Connected`]
+        ? point[`battery${slot}CurrentA`] : null,
+    })),
+    analytics: batteryAnalytics(series, slot),
+  };
+}
+
+async function createReadingCapture(env) {
+  try {
+    const result = await env.battery_management_db.prepare(`
+      INSERT INTO reading_capture_requests (requested_at_ms, status)
+      VALUES (?, 'pending')
+    `).bind(Date.now()).run();
+    return json({ success: true, captureRequestId: result.meta.last_row_id, waitingForSystem: true });
+  } catch (error) {
+    return json({ error: error.message || 'Could not request a new reading' }, 500);
+  }
+}
+
 async function readAnalytics(request, env) {
   try {
-    const rangeMs = 24 * 60 * 60 * 1000;
-    const bucketMs = Math.max(60000, Math.ceil(rangeMs / 10000 / 60000) * 60000);
     const db = env.battery_management_db;
-    const [result, batterySpecs] = await Promise.all([db.prepare(`
-      WITH recent AS (
-        SELECT timestamp_ms,
-               CAST(timestamp_ms / ? AS INTEGER) AS bucket,
-               mode,
-               battery1_json,
-               battery2_json,
-               battery1_soc,
-               battery2_soc,
-               battery1_soh,
-               battery2_soh
-        FROM readings
-        WHERE timestamp_ms >= ?
-      ),
-      bucket_modes AS (
-        SELECT bucket, mode,
-               ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY timestamp_ms DESC) AS row_num
-        FROM recent
-      )
-      SELECT CAST(recent.bucket AS INTEGER) * ? AS timestamp_ms,
-             MAX(CASE WHEN bucket_modes.row_num = 1 THEN recent.mode END) AS mode,
-             AVG(CASE WHEN json_extract(recent.battery1_json, '$.connected') = 1
-                 THEN ABS(CAST(json_extract(recent.battery1_json, '$.current') AS REAL)) END) AS battery1CurrentA,
-             AVG(CASE WHEN json_extract(recent.battery1_json, '$.connected') = 1
-               THEN CAST(json_extract(recent.battery1_json, '$.current') AS REAL) END) AS battery1NetCurrentA,
-             AVG(CASE WHEN json_extract(recent.battery1_json, '$.connected') = 1
-                 THEN recent.battery1_soc END) AS battery1Soc,
-             AVG(CASE WHEN json_extract(recent.battery1_json, '$.connected') = 1
-               THEN COALESCE(json_extract(recent.battery1_json, '$.soc_kalman'),
-                       json_extract(recent.battery1_json, '$.soc_coulomb'),
-                       json_extract(recent.battery1_json, '$.soc_ocv'),
-                       json_extract(recent.battery1_json, '$.soc')) END) AS battery1ReportedSoc,
-             AVG(CASE WHEN json_extract(recent.battery1_json, '$.connected') = 1
-                 THEN recent.battery1_soh END) AS battery1Soh,
-             MAX(CASE WHEN json_extract(recent.battery1_json, '$.connected') = 1 THEN 1 ELSE 0 END) AS battery1Connected,
-             AVG(CASE WHEN json_extract(recent.battery2_json, '$.connected') = 1
-                 THEN ABS(CAST(json_extract(recent.battery2_json, '$.current') AS REAL)) END) AS battery2CurrentA,
-             AVG(CASE WHEN json_extract(recent.battery2_json, '$.connected') = 1
-               THEN CAST(json_extract(recent.battery2_json, '$.current') AS REAL) END) AS battery2NetCurrentA,
-             AVG(CASE WHEN json_extract(recent.battery2_json, '$.connected') = 1
-                 THEN recent.battery2_soc END) AS battery2Soc,
-             AVG(CASE WHEN json_extract(recent.battery2_json, '$.connected') = 1
-               THEN COALESCE(json_extract(recent.battery2_json, '$.soc_kalman'),
-                       json_extract(recent.battery2_json, '$.soc_coulomb'),
-                       json_extract(recent.battery2_json, '$.soc_ocv'),
-                       json_extract(recent.battery2_json, '$.soc')) END) AS battery2ReportedSoc,
-             AVG(CASE WHEN json_extract(recent.battery2_json, '$.connected') = 1
-                 THEN recent.battery2_soh END) AS battery2Soh,
-             MAX(CASE WHEN json_extract(recent.battery2_json, '$.connected') = 1 THEN 1 ELSE 0 END) AS battery2Connected
-      FROM recent
-      JOIN bucket_modes ON bucket_modes.bucket = recent.bucket AND bucket_modes.row_num = 1
-      GROUP BY recent.bucket
-      ORDER BY recent.bucket ASC
-    `).bind(bucketMs, Date.now() - rangeMs, bucketMs).all(), getBatterySpecs(db)]);
-
-    const series = result.results.map((point) => ({
-      ...point,
-      timestamp_ms: Number(point.timestamp_ms),
-      battery1CurrentA: number(point.battery1CurrentA),
-      battery1NetCurrentA: number(point.battery1NetCurrentA),
-      battery1Soc: number(point.battery1Soc),
-      battery1ReportedSoc: number(point.battery1ReportedSoc),
-      battery1Soh: number(point.battery1Soh),
-      battery1Connected: point.battery1Connected === 1,
-      battery2CurrentA: number(point.battery2CurrentA),
-      battery2NetCurrentA: number(point.battery2NetCurrentA),
-      battery2Soc: number(point.battery2Soc),
-      battery2ReportedSoc: number(point.battery2ReportedSoc),
-      battery2Soh: number(point.battery2Soh),
-      battery2Connected: point.battery2Connected === 1,
-      intervalMs: bucketMs,
-    }));
-    const ratedCapacityAh = {
-      battery1: capacityForBattery(env, 1, batterySpecs),
-      battery2: capacityForBattery(env, 2, batterySpecs),
+    const rangeDays = 1;
+    const rangeMs = rangeDays * 24 * 60 * 60 * 1000;
+    const bucketMs = Math.max(60000, Math.ceil(rangeMs / 10000 / 60000) * 60000);
+    const identities = await getBatteryIdentities(db);
+    const searchParams = new URL(request.url).searchParams;
+    const chooseIdentity = (parameter, slot) => {
+      const requestedId = Number(searchParams.get(parameter));
+      return identities.find((identity) => identity.id === requestedId)
+        || identities.find((identity) => identity.active && identity.slot === slot)
+        || null;
     };
-    recalculateSocForCapacity(series, 1, ratedCapacityAh.battery1);
-    recalculateSocForCapacity(series, 2, ratedCapacityAh.battery2);
+    const leftIdentity = chooseIdentity('leftBatteryId', 1);
+    const rightIdentity = chooseIdentity('rightBatteryId', 2);
+    const [left, right] = await Promise.all([
+      readBatteryIdentityAnalytics(db, leftIdentity, Date.now() - rangeMs, bucketMs),
+      readBatteryIdentityAnalytics(db, rightIdentity, Date.now() - rangeMs, bucketMs),
+    ]);
 
     return json({
-      days: 1,
+      days: rangeDays,
       bucketMs,
-      ratedCapacityAh,
-      batteries: Object.values(batterySpecs),
-      sampleCount: series.length,
-      series: series.map((point) => ({
-        timestamp_ms: point.timestamp_ms,
-        mode: point.mode,
-        battery1Soc: point.battery1Connected ? point.battery1Soc : null,
-        battery2Soc: point.battery2Connected ? point.battery2Soc : null,
-        battery1DischargeA: point.battery1Connected
-          ? point.battery1CurrentA : null,
-        battery2DischargeA: point.mode === 'Battery1 Charging' && point.battery2Connected
-          ? point.battery2CurrentA : null,
-      })),
-      battery1: batteryAnalytics(series, 1),
-      battery2: batteryAnalytics(series, 2),
+      batteryIdentities: identities,
+      selectedIdentityIds: {
+        left: leftIdentity?.id ?? null,
+        right: rightIdentity?.id ?? null,
+      },
+      sampleCount: Math.max(left?.sampleCount ?? 0, right?.sampleCount ?? 0),
+      comparisons: { left, right },
     });
   } catch (error) {
     return json({ error: error.message || 'Could not calculate battery analytics' }, 500);
@@ -570,7 +720,8 @@ async function syncGoogleSheets(env) {
       SELECT last_reading_id FROM integration_cursors WHERE name = 'google_sheets'
     `).first();
     const result = await db.prepare(`
-      SELECT id, timestamp_ms, mode, switching, wifi_json, system_json,
+            SELECT id, capture_request_id, battery1_identity_id, battery2_identity_id,
+              timestamp_ms, mode, switching, wifi_json, system_json,
              battery1_json, battery2_json, battery1_soc, battery2_soc,
              battery1_soh, battery2_soh
       FROM readings
@@ -580,15 +731,26 @@ async function syncGoogleSheets(env) {
     `).bind(cursor.last_reading_id).all();
     if (!result.results.length) return;
 
+    const identities = await getBatteryIdentities(db);
+    const identityNames = Object.fromEntries(identities.map((identity) => [identity.id, identity.name]));
     const readings = result.results.map((row) => ({
       id: row.id,
+      captureRequestId: row.capture_request_id,
       timestampMs: row.timestamp_ms,
       mode: row.mode,
       switching: Boolean(row.switching),
       wifi: JSON.parse(row.wifi_json || '{}'),
       system: JSON.parse(row.system_json || '{}'),
-      battery1: batteryWithHealth(row.battery1_json, row.battery1_soc, row.battery1_soh),
-      battery2: batteryWithHealth(row.battery2_json, row.battery2_soc, row.battery2_soh),
+      battery1: {
+        ...batteryWithHealth(row.battery1_json, row.battery1_soc, row.battery1_soh),
+        identityId: row.battery1_identity_id,
+        identityName: identityNames[row.battery1_identity_id] || '',
+      },
+      battery2: {
+        ...batteryWithHealth(row.battery2_json, row.battery2_soc, row.battery2_soh),
+        identityId: row.battery2_identity_id,
+        identityName: identityNames[row.battery2_identity_id] || '',
+      },
     }));
     const response = await fetch(webhookUrl, {
       method: 'POST',
@@ -635,28 +797,43 @@ async function receiveTelemetry(request, env) {
     }
 
     const timestampMs = Date.now();
-    const [previous, batterySpecs] = await Promise.all([
+    const [previous, batterySpecs, pendingCapture] = await Promise.all([
       getLatestReading(env.battery_management_db),
       getBatterySpecs(env.battery_management_db),
+      env.battery_management_db.prepare(`
+        SELECT id
+        FROM reading_capture_requests
+        WHERE status = 'pending'
+        ORDER BY id ASC
+        LIMIT 1
+      `).first(),
     ]);
     const battery1 = normalizeBattery(data.battery1);
     const battery2 = normalizeBattery(data.battery2);
     const system = data.system && typeof data.system === 'object' ? data.system : {};
     const wifi = data.wifi && typeof data.wifi === 'object' ? data.wifi : {};
-    const elapsedSeconds = previous
-      ? Math.max(0, (timestampMs - previous.timestamp_ms) / 1000)
+    const captureRequestId = String(data.mode || '').trim().toUpperCase() !== 'SYSTEM OFF'
+      ? pendingCapture?.id ?? null
+      : null;
+    const previousInIdentity = previous?.battery1_identity_id === (batterySpecs[1]?.identity_id ?? null)
+      && previous?.battery2_identity_id === (batterySpecs[2]?.identity_id ?? null)
+      ? previous
+      : null;
+    const elapsedSeconds = previousInIdentity
+      ? Math.max(0, (timestampMs - previousInIdentity.timestamp_ms) / 1000)
       : 0;
-    const battery1Soc = estimateSoc(battery1, previous?.battery1_soc ?? null, elapsedSeconds, env, 1, batterySpecs);
-    const battery2Soc = estimateSoc(battery2, previous?.battery2_soc ?? null, elapsedSeconds, env, 2, batterySpecs);
+    const battery1Soc = estimateSoc(battery1, previousInIdentity?.battery1_soc ?? null, elapsedSeconds, env, 1, batterySpecs);
+    const battery2Soc = estimateSoc(battery2, previousInIdentity?.battery2_soc ?? null, elapsedSeconds, env, 2, batterySpecs);
     const battery1Soh = estimateSoh(battery1, env, 1, batterySpecs);
     const battery2Soh = estimateSoh(battery2, env, 2, batterySpecs);
 
-    await env.battery_management_db.prepare(`
+    const result = await env.battery_management_db.prepare(`
       INSERT INTO readings (
         timestamp_ms, mode, switching, wifi_json, system_json,
         battery1_json, battery2_json,
-        battery1_soc, battery2_soc, battery1_soh, battery2_soh
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        battery1_soc, battery2_soc, battery1_soh, battery2_soh, capture_request_id,
+        battery1_identity_id, battery2_identity_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       timestampMs,
       data.mode ?? null,
@@ -669,7 +846,18 @@ async function receiveTelemetry(request, env) {
       battery2Soc,
       battery1Soh,
       battery2Soh,
+      captureRequestId,
+      batterySpecs[1]?.identity_id ?? null,
+      batterySpecs[2]?.identity_id ?? null,
     ).run();
+
+    if (captureRequestId !== null) {
+      await env.battery_management_db.prepare(`
+        UPDATE reading_capture_requests
+        SET status = 'captured', captured_at_ms = ?, reading_id = ?
+        WHERE id = ? AND status = 'pending'
+      `).bind(timestampMs, result.meta.last_row_id, captureRequestId).run();
+    }
 
     return json({ success: true, receivedAt: timestampMs });
   } catch (error) {
@@ -679,11 +867,20 @@ async function receiveTelemetry(request, env) {
 
 async function readEsp32(env) {
   try {
-    const row = await getLatestReading(env.battery_management_db);
-    if (!row) return json({ connected: false, error: 'Waiting for first ESP32 reading' });
+    const [row, batterySpecs, identities] = await Promise.all([
+      getLatestReading(env.battery_management_db),
+      getBatterySpecs(env.battery_management_db),
+      getBatteryIdentities(env.battery_management_db),
+    ]);
+    if (!row) return json({
+      connected: false,
+      error: 'Waiting for first ESP32 reading',
+      batteries: Object.values(batterySpecs),
+    });
 
     const wifi = JSON.parse(row.wifi_json);
     const system = JSON.parse(row.system_json || '{}');
+    const identityNames = Object.fromEntries(identities.map((identity) => [identity.id, identity.name]));
     const isFresh = Date.now() - row.timestamp_ms <= 15000;
     const connected = isFresh && system.wifiConnected !== false;
 
@@ -695,8 +892,17 @@ async function readEsp32(env) {
       switching: Boolean(row.switching),
       system,
       wifi,
-      battery1: JSON.parse(row.battery1_json),
-      battery2: JSON.parse(row.battery2_json),
+      battery1: {
+        ...JSON.parse(row.battery1_json),
+        identityId: row.battery1_identity_id,
+        identityName: identityNames[row.battery1_identity_id] || '',
+      },
+      battery2: {
+        ...JSON.parse(row.battery2_json),
+        identityId: row.battery2_identity_id,
+        identityName: identityNames[row.battery2_identity_id] || '',
+      },
+      batteries: Object.values(batterySpecs),
     });
   } catch (error) {
     return json({ connected: false, error: error.message }, 500);
@@ -810,6 +1016,7 @@ export default {
 
     if (pathname === '/api/esp32' && request.method === 'GET') return readEsp32(env);
     if (pathname === '/api/readings' && request.method === 'GET') return readHistory(request, env);
+    if (pathname === '/api/reading-captures' && request.method === 'POST') return createReadingCapture(env);
     if (pathname === '/api/analytics' && request.method === 'GET') return readAnalytics(request, env);
     if (pathname === '/api/health' && request.method === 'GET') return getHealth(env);
     if (pathname === '/api/batteries' && request.method === 'GET') return readBatteries(env);

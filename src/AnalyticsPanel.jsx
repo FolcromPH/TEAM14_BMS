@@ -5,8 +5,8 @@ import './App.css'
 const AnalyticsBatteryPanel = lazy(() => import('./AnalyticsBatteryPanel.jsx'))
 
 export default function AnalyticsPanel() {
-  const [leftBattery, setLeftBattery] = useState('1')
-  const [rightBattery, setRightBattery] = useState('2')
+  const [leftBatteryId, setLeftBatteryId] = useState('')
+  const [rightBatteryId, setRightBatteryId] = useState('')
   const [analytics, setAnalytics] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -17,11 +17,14 @@ export default function AnalyticsPanel() {
 
     async function load() {
       try {
-        const response = await fetch('/api/analytics')
+        const params = new URLSearchParams({ leftBatteryId, rightBatteryId })
+        const response = await fetch(`/api/analytics?${params}`)
         const result = await response.json()
         if (!response.ok) throw new Error(result.error || 'Could not load battery analytics')
         if (stopped) return
         setAnalytics(result)
+        setLeftBatteryId((current) => current || String(result.selectedIdentityIds.left || ''))
+        setRightBatteryId((current) => current || String(result.selectedIdentityIds.right || ''))
         setError('')
       } catch (requestError) {
         if (stopped) return
@@ -37,7 +40,7 @@ export default function AnalyticsPanel() {
       stopped = true
       window.clearInterval(interval)
     }
-  }, [refreshKey])
+  }, [refreshKey, leftBatteryId, rightBatteryId])
 
   function refresh() {
     setLoading(true)
@@ -45,8 +48,12 @@ export default function AnalyticsPanel() {
   }
 
   const noReadings = !loading && analytics?.sampleCount === 0
-  const batteryNames = Object.fromEntries((analytics?.batteries ?? []).map((battery) => [battery.slot, battery.name]))
-  const graphSlots = [Number(leftBattery), Number(rightBattery)]
+  const identities = analytics?.batteryIdentities ?? []
+  const comparisons = analytics?.comparisons ?? {}
+  const graphSelections = [
+    { side: 'left', identityId: leftBatteryId, data: comparisons.left },
+    { side: 'right', identityId: rightBatteryId, data: comparisons.right },
+  ]
 
   return (
     <section className="analytics-view" aria-labelledby="analytics-title">
@@ -62,17 +69,16 @@ export default function AnalyticsPanel() {
       </div>
 
       <div className="analytics-toolbar">
-        <span className="analytics-period-label">Rolling 24 hours</span>
         <label className="history-select-field">
           <span>Left graph</span>
-          <select className="battery-history-filter" value={leftBattery} onChange={(event) => setLeftBattery(event.target.value)}>
-            {[1, 2].map((slot) => <option value={slot} key={slot}>{batteryNames[slot] || `Battery ${slot}`}</option>)}
+          <select className="battery-history-filter" value={leftBatteryId} onChange={(event) => setLeftBatteryId(event.target.value)}>
+            {identities.map((identity) => <option value={identity.id} key={identity.id}>{identity.name}{identity.active ? ` · Slot ${identity.slot}` : ` · Previous #${identity.id}`}</option>)}
           </select>
         </label>
         <label className="history-select-field">
           <span>Right graph</span>
-          <select className="battery-history-filter" value={rightBattery} onChange={(event) => setRightBattery(event.target.value)}>
-            {[1, 2].map((slot) => <option value={slot} key={slot}>{batteryNames[slot] || `Battery ${slot}`}</option>)}
+          <select className="battery-history-filter" value={rightBatteryId} onChange={(event) => setRightBatteryId(event.target.value)}>
+            {identities.map((identity) => <option value={identity.id} key={identity.id}>{identity.name}{identity.active ? ` · Slot ${identity.slot}` : ` · Previous #${identity.id}`}</option>)}
           </select>
         </label>
         <button className="icon-button" type="button" title="Refresh analytics" aria-label="Refresh analytics" onClick={refresh}>
@@ -83,17 +89,18 @@ export default function AnalyticsPanel() {
       {error && <div className="notice notice-error" role="alert">{error}</div>}
       {noReadings && <div className="analytics-empty">No database readings in this range.</div>}
 
-      {analytics?.sampleCount > 0 && (
+      {graphSelections.some((selection) => selection.data) && (
         <>
           <div className="analytics-battery-grid">
-            {graphSlots.map((index, graphIndex) => (
-              <Suspense fallback={<div className="analytics-panel-loading">Loading battery analysis...</div>} key={`${graphIndex}-${index}`}>
+            {graphSelections.map(({ side, identityId, data }, graphIndex) => (
+              data && <Suspense fallback={<div className="analytics-panel-loading">Loading battery analysis...</div>} key={`${side}-${identityId}`}>
                 <AnalyticsBatteryPanel
-                  index={index}
-                  batteryName={batteryNames[index] || `Battery ${index}`}
-                  analytics={analytics[`battery${index}`]}
-                  series={analytics.series}
-                  ratedCapacityAh={analytics.ratedCapacityAh[`battery${index}`]}
+                  index={graphIndex + 1}
+                  batterySlot={data.slot}
+                  batteryName={data.name}
+                  analytics={data.analytics}
+                  series={data.series}
+                  ratedCapacityAh={data.ratedCapacityAh}
                 />
               </Suspense>
             ))}
