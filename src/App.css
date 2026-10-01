@@ -942,6 +942,53 @@
   .section-heading { align-items: flex-end; }
 }
 
+@media (max-width: 760px) {
+  .dashboard-tabs,
+  .battery-grid,
+  .history-battery-grid,
+  .analytics-battery-grid,
+  .inventory-grid,
+  .reading-table-scroll {
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .dashboard-tabs {
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+  }
+
+  .dashboard-tabs::-webkit-scrollbar,
+  .battery-grid::-webkit-scrollbar,
+  .history-battery-grid::-webkit-scrollbar,
+  .analytics-battery-grid::-webkit-scrollbar,
+  .inventory-grid::-webkit-scrollbar,
+  .reading-table-scroll::-webkit-scrollbar { display: none; }
+
+  .dashboard-tab { flex: 0 0 auto; scroll-snap-align: start; white-space: nowrap; }
+
+  .battery-grid,
+  .history-battery-grid,
+  .analytics-battery-grid,
+  .inventory-grid {
+    display: flex;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    padding-bottom: 4px;
+  }
+
+  .battery-grid > *,
+  .history-battery-grid > *,
+  .analytics-battery-grid > *,
+  .inventory-grid > * {
+    flex: 0 0 min(86vw, 520px);
+    scroll-snap-align: start;
+  }
+
+  .reading-table-scroll { overflow-x: auto; }
+}
+
 @media (max-width: 520px) {
   .topbar { align-items: flex-start; flex-direction: column; gap: 12px; }
   .brand-lockup h1 { font-size: 20px; }

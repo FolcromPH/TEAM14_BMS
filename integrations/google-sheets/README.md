@@ -1,6 +1,6 @@
 # Google Sheets sync
 
-The Worker batches D1 telemetry into a Google Sheet once per minute. It retries unsent rows on later runs and starts with the oldest D1 reading, so existing database history is backfilled too. The `Readings` sheet keeps the two INA260 slots in separate columns and includes each sample's battery identity ID and saved name. Renaming a battery creates a new identity, so replacement batteries remain distinguishable in history and comparisons.
+The Worker batches D1 telemetry into a Google Sheet once per minute. It retries unsent rows on later runs and starts with the oldest D1 reading, so existing database history is backfilled too. The `Readings` sheet keeps the two INA260 slots in separate columns and includes each sample's battery identity ID and saved name. Renaming a battery creates a new identity, so replacement batteries remain distinguishable in history and comparisons. Each requested **New reading** capture also gets a separate `Capture <ID> - <battery names>` worksheet; `Readings` remains the complete history.
 
 ## 1. Create the Apps Script endpoint
 
