@@ -172,11 +172,16 @@ function DatabaseReader() {
       }
     }
 
-    loadHistory()
-    const interval = window.setInterval(loadHistory, 30000)
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') loadHistory()
+    }
+    refreshWhenVisible()
+    const interval = window.setInterval(refreshWhenVisible, 300000)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
     return () => {
       stopped = true
       window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
     }
   }, [range, refreshToken, tableBatteryId, tableSlot, tableSortMode, metricKey, leftBatteryId, rightBatteryId])
 

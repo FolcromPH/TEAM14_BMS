@@ -23,7 +23,7 @@ function AnalyticsMetric({ label, value, unit, detail }) {
   )
 }
 
-export default function AnalyticsBatteryPanel({ index, batterySlot, batteryName, analytics, series, ratedCapacityAh }) {
+export default function AnalyticsBatteryPanel({ index, batterySlot, batteryName, analytics, series, ratedCapacityAh, rangeLabel }) {
   const color = index === 1 ? '#23785f' : '#b06c29'
   const socKey = `battery${batterySlot}Soc`
   const hasSocSamples = series.some((point) => Number.isFinite(point[socKey]))
@@ -59,7 +59,11 @@ export default function AnalyticsBatteryPanel({ index, batterySlot, batteryName,
           value={format(analytics.drainPercentPerHour)}
           unit=" %/h"
           detail={analytics.drainPercentPerHour === null
-            ? hasSocSamples ? 'No net SOC decline observed in 24 h' : 'No connected-sensor data'
+            ? !hasSocSamples
+              ? 'No connected-sensor data'
+              : analytics.socDeclinePercent > 0
+                ? 'SOC decline too small to estimate reliably'
+                : `No net SOC decline observed in ${rangeLabel}`
             : `Net decline over ${format(analytics.socObservationHours, 1)} observed hours`}
         />
         <AnalyticsMetric
@@ -83,7 +87,7 @@ export default function AnalyticsBatteryPanel({ index, batterySlot, batteryName,
       </div>
 
       <div className="analytics-chart-title">
-        <span>State of charge · last 24 hours</span>
+        <span>State of charge · {rangeLabel}</span>
         <span>%</span>
       </div>
       {hasSocSamples ? (

@@ -3,10 +3,17 @@ import { Activity, RefreshCw } from 'lucide-react'
 import './App.css'
 
 const AnalyticsBatteryPanel = lazy(() => import('./AnalyticsBatteryPanel.jsx'))
+const ANALYTICS_RANGES = [
+  { value: '1h', label: 'Last hour' },
+  { value: '24h', label: 'Last 24 hours' },
+  { value: '7d', label: 'Last 7 days' },
+  { value: '30d', label: 'Last 30 days' },
+]
 
 export default function AnalyticsPanel() {
   const [leftBatteryId, setLeftBatteryId] = useState('')
   const [rightBatteryId, setRightBatteryId] = useState('')
+  const [range, setRange] = useState('1h')
   const [analytics, setAnalytics] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -14,11 +21,12 @@ export default function AnalyticsPanel() {
 
   useEffect(() => {
     let stopped = false
+    const controller = new AbortController()
 
     async function load() {
       try {
-        const params = new URLSearchParams({ leftBatteryId, rightBatteryId })
-        const response = await fetch(`/api/analytics?${params}`)
+        const params = new URLSearchParams({ leftBatteryId, rightBatteryId, range })
+        const response = await fetch(`/api/analytics?${params}`, { signal: controller.signal })
         const result = await response.json()
         if (!response.ok) throw new Error(result.error || 'Could not load battery analytics')
         if (stopped) return
@@ -27,20 +35,26 @@ export default function AnalyticsPanel() {
         setRightBatteryId((current) => current || String(result.selectedIdentityIds.right || ''))
         setError('')
       } catch (requestError) {
-        if (stopped) return
+        if (stopped || requestError.name === 'AbortError') return
         setError(requestError.message || 'Could not load battery analytics')
       } finally {
         if (!stopped) setLoading(false)
       }
     }
 
-    load()
-    const interval = window.setInterval(load, 60000)
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') load()
+    }
+    refreshWhenVisible()
+    const interval = window.setInterval(refreshWhenVisible, 300000)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
     return () => {
       stopped = true
+      controller.abort()
       window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
     }
-  }, [refreshKey, leftBatteryId, rightBatteryId])
+  }, [refreshKey, leftBatteryId, rightBatteryId, range])
 
   function refresh() {
     setLoading(true)
@@ -69,6 +83,12 @@ export default function AnalyticsPanel() {
       </div>
 
       <div className="analytics-toolbar">
+        <label className="history-select-field">
+          <span>Analysis period</span>
+          <select className="battery-history-filter" value={range} onChange={(event) => setRange(event.target.value)}>
+            {ANALYTICS_RANGES.map((item) => <option value={item.value} key={item.value}>{item.label}</option>)}
+          </select>
+        </label>
         <label className="history-select-field">
           <span>Left graph</span>
           <select className="battery-history-filter" value={leftBatteryId} onChange={(event) => setLeftBatteryId(event.target.value)}>
@@ -101,12 +121,13 @@ export default function AnalyticsPanel() {
                   analytics={data.analytics}
                   series={data.series}
                   ratedCapacityAh={data.ratedCapacityAh}
+                  rangeLabel={ANALYTICS_RANGES.find((item) => item.value === range)?.label.toLowerCase() ?? 'last hour'}
                 />
               </Suspense>
             ))}
           </div>
           <p className="analytics-method-note">
-            Drain is the net SOC decrease across valid readings in the last 24 hours. When the firmware does not send BMS-reported SOC, the Worker estimates SOC by integrating INA current against rated capacity, so the 1% timing is an estimate. A battery BMS with SOC output gives a more reliable trend.
+            Drain is the net SOC decrease across valid readings in the selected period. Estimates are withheld until at least 0.1 percentage points of decline are observed to avoid extrapolating sensor drift. When the firmware does not send BMS-reported SOC, the Worker estimates SOC by integrating INA current against rated capacity, so the 1% timing is an estimate. A battery BMS with SOC output gives a more reliable trend.
           </p>
         </>
       )}

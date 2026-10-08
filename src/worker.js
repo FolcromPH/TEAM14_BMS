@@ -424,6 +424,8 @@ async function readHistory(request, env) {
   }
 }
 
+const MIN_RELIABLE_SOC_DECLINE_PERCENT = 0.1;
+
 function batteryAnalytics(series, index) {
   const batteryKey = `battery${index}`;
   const dischargeMode = `Battery${index === 1 ? 2 : 1} Charging`;
@@ -462,7 +464,9 @@ function batteryAnalytics(series, index) {
   }
 
   const averageDischargeA = dischargeHours > 0 ? dischargedAmpHours / dischargeHours : null;
-  const drainPercentPerHour = socObservationHours > 0 && netSocChange < 0
+  const socDeclinePercent = Math.max(0, -netSocChange);
+  const drainPercentPerHour = socObservationHours > 0
+    && socDeclinePercent >= MIN_RELIABLE_SOC_DECLINE_PERCENT
     ? -netSocChange / socObservationHours
     : null;
   const latestSample = [...series].reverse().find((point) => (
@@ -523,6 +527,7 @@ function batteryAnalytics(series, index) {
     drainPercentPerHour,
     minutesPerPercentDrop: drainPercentPerHour > 0 ? 60 / drainPercentPerHour : null,
     socObservationHours,
+    socDeclinePercent,
     latestSoc: latestSample?.[`${batteryKey}Soc`] ?? null,
     latestSoh: latestSohSample?.[`${batteryKey}Soh`] ?? null,
     hoursToEmpty,
@@ -581,50 +586,53 @@ function recalculateSocForCapacity(series, index, capacityAh) {
   }
 }
 
-async function readBatteryIdentityAnalytics(db, identity, startMs, bucketMs) {
+async function readBatteryIdentityAnalytics(db, identity, startMs, bucketMs, bucketCount) {
   if (!identity) return null;
   const slot = identity.slot;
   const batteryColumn = `battery${slot}_json`;
   const identityColumn = `battery${slot}_identity_id`;
+  const identityTimestampIndex = `readings_battery${slot}_timestamp_idx`;
   const socColumn = `battery${slot}_soc`;
   const sohColumn = `battery${slot}_soh`;
   const result = await db.prepare(`
-    WITH recent AS (
-      SELECT timestamp_ms,
-             CAST(timestamp_ms / ? AS INTEGER) AS bucket,
-             mode,
-             ${batteryColumn} AS battery_json,
-             ${socColumn} AS battery_soc,
-             ${sohColumn} AS battery_soh
-      FROM readings
-      WHERE timestamp_ms >= ? AND ${identityColumn} = ?
+    WITH RECURSIVE buckets(bucket) AS (
+      SELECT 0
+      UNION ALL
+      SELECT bucket + 1 FROM buckets WHERE bucket + 1 < ?
     ),
-    bucket_modes AS (
-      SELECT bucket, mode,
-             ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY timestamp_ms DESC) AS row_num
-      FROM recent
+    sampled AS (
+      SELECT bucket,
+             (
+               SELECT id
+               FROM readings INDEXED BY ${identityTimestampIndex}
+               WHERE ${identityColumn} = ?
+                 AND timestamp_ms >= ? + buckets.bucket * ?
+                 AND timestamp_ms < ? + (buckets.bucket + 1) * ?
+               ORDER BY timestamp_ms DESC, id DESC
+               LIMIT 1
+             ) AS reading_id
+      FROM buckets
     )
-    SELECT CAST(recent.bucket AS INTEGER) * ? AS timestamp_ms,
-           MAX(CASE WHEN bucket_modes.row_num = 1 THEN recent.mode END) AS mode,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN ABS(CAST(json_extract(recent.battery_json, '$.current') AS REAL)) END) AS current_a,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN CAST(json_extract(recent.battery_json, '$.current') AS REAL) END) AS net_current_a,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN recent.battery_soc END) AS soc,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN COALESCE(json_extract(recent.battery_json, '$.soc_kalman'),
-                     json_extract(recent.battery_json, '$.soc_coulomb'),
-                     json_extract(recent.battery_json, '$.soc_ocv'),
-                     json_extract(recent.battery_json, '$.soc')) END) AS reported_soc,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN recent.battery_soh END) AS soh,
-           MAX(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1 THEN 1 ELSE 0 END) AS connected
-    FROM recent
-    JOIN bucket_modes ON bucket_modes.bucket = recent.bucket AND bucket_modes.row_num = 1
-    GROUP BY recent.bucket
-    ORDER BY recent.bucket ASC
-  `).bind(bucketMs, startMs, identity.id, bucketMs).all();
+    SELECT readings.timestamp_ms,
+           readings.mode,
+           CASE WHEN json_extract(readings.${batteryColumn}, '$.connected') = 1
+             THEN ABS(CAST(json_extract(readings.${batteryColumn}, '$.current') AS REAL)) END AS current_a,
+           CASE WHEN json_extract(readings.${batteryColumn}, '$.connected') = 1
+             THEN CAST(json_extract(readings.${batteryColumn}, '$.current') AS REAL) END AS net_current_a,
+           CASE WHEN json_extract(readings.${batteryColumn}, '$.connected') = 1
+             THEN readings.${socColumn} END AS soc,
+           CASE WHEN json_extract(readings.${batteryColumn}, '$.connected') = 1
+             THEN COALESCE(json_extract(readings.${batteryColumn}, '$.soc_kalman'),
+                   json_extract(readings.${batteryColumn}, '$.soc_coulomb'),
+                   json_extract(readings.${batteryColumn}, '$.soc_ocv'),
+                   json_extract(readings.${batteryColumn}, '$.soc')) END AS reported_soc,
+           CASE WHEN json_extract(readings.${batteryColumn}, '$.connected') = 1
+             THEN readings.${sohColumn} END AS soh,
+           json_extract(readings.${batteryColumn}, '$.connected') AS connected
+    FROM sampled
+    JOIN readings ON readings.id = sampled.reading_id
+    ORDER BY sampled.bucket ASC
+  `).bind(bucketCount, identity.id, startMs, bucketMs, startMs, bucketMs).all();
   const series = result.results.map((point) => ({
     timestamp_ms: Number(point.timestamp_ms),
     mode: point.mode,
@@ -671,9 +679,18 @@ async function createReadingCapture(env) {
 async function readAnalytics(request, env) {
   try {
     const db = env.battery_management_db;
-    const rangeDays = 1;
-    const rangeMs = rangeDays * 24 * 60 * 60 * 1000;
-    const bucketMs = Math.max(60000, Math.ceil(rangeMs / 10000 / 60000) * 60000);
+    const ranges = {
+      '1h': 60 * 60 * 1000,
+      '24h': 24 * 60 * 60 * 1000,
+      '7d': 7 * 24 * 60 * 60 * 1000,
+      '30d': 30 * 24 * 60 * 60 * 1000,
+    };
+    const requestedRange = new URL(request.url).searchParams.get('range');
+    const range = requestedRange && Object.hasOwn(ranges, requestedRange) ? requestedRange : '1h';
+    const rangeMs = ranges[range];
+    const rangeDays = rangeMs / (24 * 60 * 60 * 1000);
+    const bucketCount = Math.min(600, Math.max(1, Math.ceil(rangeMs / 60000)));
+    const bucketMs = Math.ceil(rangeMs / bucketCount);
     const identities = await getBatteryIdentities(db);
     const searchParams = new URL(request.url).searchParams;
     const chooseIdentity = (parameter, slot) => {
@@ -684,12 +701,15 @@ async function readAnalytics(request, env) {
     };
     const leftIdentity = chooseIdentity('leftBatteryId', 1);
     const rightIdentity = chooseIdentity('rightBatteryId', 2);
-    const [left, right] = await Promise.all([
-      readBatteryIdentityAnalytics(db, leftIdentity, Date.now() - rangeMs, bucketMs),
-      readBatteryIdentityAnalytics(db, rightIdentity, Date.now() - rangeMs, bucketMs),
-    ]);
+    const startMs = Date.now() - rangeMs;
+    const leftPromise = readBatteryIdentityAnalytics(db, leftIdentity, startMs, bucketMs, bucketCount);
+    const rightPromise = rightIdentity?.id === leftIdentity?.id
+      ? leftPromise
+      : readBatteryIdentityAnalytics(db, rightIdentity, startMs, bucketMs, bucketCount);
+    const [left, right] = await Promise.all([leftPromise, rightPromise]);
 
     return json({
+      range,
       days: rangeDays,
       bucketMs,
       batteryIdentities: identities,
