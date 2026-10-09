@@ -33,7 +33,7 @@ function drainDetail(analytics, hasSocSamples, rangeLabel) {
     ? `From completed cycles: ${hours} h of discharge`
     : analytics.drainSource === 'soc'
       ? `SOC decline over ${hours} h of discharge`
-      : `Average load ÷ rated capacity (no SOC decline measured yet)`
+      : 'Average load divided by rated capacity (no SOC decline measured yet)'
 }
 
 export default function AnalyticsBatteryPanel({
