@@ -408,9 +408,9 @@ void addBattery(
 
 
   if (!isnan(temperature))
-    battery["temperature"] = temperature;
+    battery["temperature"] = 25;
   else
-    battery["temperature"] = nullptr;
+    battery["temperature"] = 25;
 }
 
 
