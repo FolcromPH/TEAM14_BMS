@@ -1,8 +1,17 @@
+import { HEALTH_DEFAULTS, isRestMode, processTelemetry, scoreCycle, stepSoc } from './lib/health.js';
+import { buildForecast } from './lib/forecast.js';
+import { CSV_HEADERS, formatTimestamp, readingToCsvLine } from './lib/csv.js';
+
 const BATTERY_FIELDS = [
   'connected', 'voltage', 'current', 'power', 'temperature', 'soc', 'soh', 'status',
   'soc_kalman', 'soc_coulomb', 'soc_ocv', 'soh_pct', 'soh_relative_pct',
   'measuredCapacityAh', 'capacityAh', 'capacity_ah', 'effective_capacity_Ah',
 ];
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_CUSTOM_RANGE_MS = 366 * DAY_MS;
+const DEFAULT_RECONNECT_GAP_SECONDS = 120;
+const RECHAIN_ROW_LIMIT = 5000;
 
 function number(value) {
   if (value === null || value === undefined || value === '') return null;
@@ -32,6 +41,21 @@ function capacityForBattery(env, index, batterySpecs = {}) {
     : number(env.BATTERY_CAPACITY_AH) ?? 100;
 }
 
+function healthParams(env) {
+  const params = { ...HEALTH_DEFAULTS };
+  const overrides = {
+    chargeEfficiency: env.CHARGE_EFFICIENCY,
+    minDodPercent: env.MIN_DOD_PERCENT,
+    ocvVoltsPerPercent: env.OCV_VOLTS_PER_PERCENT,
+    ocvFullVoltage: env.OCV_FULL_VOLTAGE,
+  };
+  for (const [key, value] of Object.entries(overrides)) {
+    const parsed = number(value);
+    if (parsed !== null && parsed > 0) params[key] = parsed;
+  }
+  return params;
+}
+
 function normalizeBattery(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(
@@ -47,43 +71,36 @@ function batteryWithHealth(value, soc, soh) {
   return { ...battery, soc, soh };
 }
 
-function estimateSoc(battery, previousSoc, elapsedSeconds, env, index, batterySpecs) {
-  const reportedSoc = firstNumber(battery, ['soc_kalman', 'soc_coulomb', 'soc_ocv', 'soc']);
-  if (reportedSoc !== null) return clampPercent(reportedSoc);
-
-  const baseSoc = previousSoc ?? number(env.INITIAL_SOC) ?? 100;
-  const current = firstNumber(battery, ['current', 'currentA', 'amps']);
-  const capacityAh = capacityForBattery(env, index, batterySpecs);
-  if (previousSoc === null || current === null || capacityAh <= 0) return clampPercent(baseSoc);
-
-  return clampPercent(baseSoc + (current * elapsedSeconds / 3600 / capacityAh) * 100);
+function engineReading(battery) {
+  const voltage = number(battery.voltage);
+  return {
+    connected: battery.connected !== false && voltage !== null,
+    voltage,
+    current: firstNumber(battery, ['current', 'currentA', 'amps']),
+    reportedSoc: firstNumber(battery, ['soc_kalman', 'soc_coulomb', 'soc_ocv', 'soc']),
+  };
 }
 
-function estimateSoh(battery, env, index, batterySpecs) {
-  const reportedSoh = firstNumber(battery, ['soh_relative_pct', 'soh_pct', 'soh']);
-  if (reportedSoh !== null) return clampPercent(reportedSoh);
-
-  const measuredCapacity = firstNumber(battery, [
-    'measuredCapacityAh', 'capacityAh', 'capacity_ah', 'effective_capacity_Ah',
-  ]);
-  const ratedCapacity = capacityForBattery(env, index, batterySpecs);
-  if (measuredCapacity === null || ratedCapacity <= 0) return null;
-  return clampPercent(measuredCapacity / ratedCapacity * 100);
+function reportedSohFrom(battery) {
+  const reported = firstNumber(battery, ['soh_relative_pct', 'soh_pct', 'soh']);
+  return reported === null ? null : clampPercent(reported);
 }
 
-function healthForBattery(battery, soc, soh, env, index, batterySpecs) {
+function healthForBattery(battery, soc, soh, env, index, batterySpecs, cycleInfo = null) {
   const hasSignal = battery.connected === true || Object.entries(battery).some(
     ([field, value]) => field !== 'connected' && value !== null && value !== undefined,
   );
   const capacityAh = firstNumber(battery, [
     'measuredCapacityAh', 'capacityAh', 'capacity_ah', 'effective_capacity_Ah',
-  ]);
+  ]) ?? cycleInfo?.capacity_ah ?? null;
 
   return {
     soc: hasSignal ? soc : null,
     soh: hasSignal ? soh : null,
     capacityAh,
     ratedCapacityAh: capacityForBattery(env, index, batterySpecs),
+    cycleCount: cycleInfo?.cycles ?? 0,
+    lastCycleAtMs: cycleInfo?.ended_at_ms ?? null,
     ...(!hasSignal ? { error: 'Battery not reporting live data' } : {}),
     source: 'd1',
   };
@@ -92,6 +109,29 @@ function healthForBattery(battery, soc, soh, env, index, batterySpecs) {
 function json(data, status = 200) {
   return Response.json(data, { status });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Time ranges (relative presets or a custom from/to window, so old data such as Dataset_2.csv
+// can be looked up by its own timestamps)
+// ---------------------------------------------------------------------------------------------
+
+function resolveRange(searchParams, presets, fallback) {
+  const from = number(searchParams.get('from'));
+  const to = number(searchParams.get('to'));
+  if (from !== null && to !== null && to > from) {
+    const endMs = to;
+    const startMs = Math.max(from, endMs - MAX_CUSTOM_RANGE_MS);
+    return { key: 'custom', startMs, endMs, rangeMs: endMs - startMs, custom: true };
+  }
+  const requested = searchParams.get('range');
+  const key = requested && Object.hasOwn(presets, requested) ? requested : fallback;
+  const endMs = Date.now();
+  return { key, startMs: endMs - presets[key], endMs, rangeMs: presets[key], custom: false };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Database helpers
+// ---------------------------------------------------------------------------------------------
 
 async function getLatestReading(db) {
   return db.prepare(`
@@ -117,7 +157,7 @@ async function getBatterySpecs(db) {
 async function getBatteryIdentities(db) {
   const [identities, currentBatteries] = await Promise.all([
     db.prepare(`
-      SELECT id, slot, name, voltage_v, capacity_mah, created_at_ms
+      SELECT id, slot, name, voltage_v, capacity_mah, created_at_ms, full_voltage_v
       FROM battery_identities
       ORDER BY created_at_ms DESC, id DESC
     `).all(),
@@ -129,62 +169,379 @@ async function getBatteryIdentities(db) {
   }));
 }
 
-async function readBatteryIdentityHistory(db, identity, startMs, bucketMs) {
-  if (!identity) return { series: [], latest: null };
-  const slot = identity.slot;
-  const identityColumn = `battery${slot}_identity_id`;
-  const batteryColumn = `battery${slot}_json`;
-  const socColumn = `battery${slot}_soc`;
-  const sohColumn = `battery${slot}_soh`;
-  const [seriesResult, latest] = await Promise.all([
+async function lastRecordedForIdentity(db, slot, identityId) {
+  return db.prepare(`
+    SELECT timestamp_ms, battery${slot}_soc AS soc, battery${slot}_soh AS soh
+    FROM readings
+    WHERE battery${slot}_identity_id = ? AND battery${slot}_soc IS NOT NULL
+    ORDER BY timestamp_ms DESC
+    LIMIT 1
+  `).bind(identityId).first();
+}
+
+async function latestIdentityCycle(db, identityId) {
+  return db.prepare(`
+    SELECT capacity_ah, soh_raw, soh_reported, ended_at_ms,
+           (SELECT COUNT(*) FROM battery_cycles WHERE identity_id = ? AND soh_reported IS NOT NULL) AS cycles
+    FROM battery_cycles
+    WHERE identity_id = ? AND soh_reported IS NOT NULL
+    ORDER BY id DESC
+    LIMIT 1
+  `).bind(identityId, identityId).first();
+}
+
+async function scoringContext(db, identityId) {
+  const [baseline, recent, last, count] = await Promise.all([
     db.prepare(`
-      SELECT CAST(timestamp_ms / ? AS INTEGER) * ? AS timestamp_ms,
-             AVG(json_extract(${batteryColumn}, '$.power')) AS power,
-             AVG(json_extract(${batteryColumn}, '$.current')) AS current,
-             AVG(json_extract(${batteryColumn}, '$.voltage')) AS voltage,
-             AVG(json_extract(${batteryColumn}, '$.temperature')) AS temperature,
-             AVG(${socColumn}) AS soc
-      FROM readings
-      WHERE timestamp_ms >= ? AND ${identityColumn} = ?
-      GROUP BY CAST(timestamp_ms / ? AS INTEGER)
-      ORDER BY timestamp_ms ASC
-    `).bind(
-      bucketMs,
-      bucketMs,
-      startMs,
-      identity.id,
-      bucketMs,
-    ).all(),
+      SELECT capacity_ah FROM battery_cycles
+      WHERE identity_id = ? AND soh_raw IS NOT NULL
+      ORDER BY id ASC LIMIT 1
+    `).bind(identityId).first(),
     db.prepare(`
-      SELECT timestamp_ms, mode, ${batteryColumn} AS battery_json,
-             ${socColumn} AS battery_soc, ${sohColumn} AS battery_soh
-      FROM readings
-      WHERE timestamp_ms >= ? AND ${identityColumn} = ?
-      ORDER BY timestamp_ms DESC
-      LIMIT 1
-    `).bind(startMs, identity.id).first(),
+      SELECT soh_raw FROM battery_cycles
+      WHERE identity_id = ? AND soh_raw IS NOT NULL
+      ORDER BY id DESC LIMIT ?
+    `).bind(identityId, HEALTH_DEFAULTS.medianWindow).all(),
+    db.prepare(`
+      SELECT soh_reported FROM battery_cycles
+      WHERE identity_id = ? AND soh_reported IS NOT NULL
+      ORDER BY id DESC LIMIT 1
+    `).bind(identityId).first(),
+    db.prepare(`
+      SELECT COUNT(*) AS n FROM battery_cycles
+      WHERE identity_id = ? AND soh_reported IS NOT NULL
+    `).bind(identityId).first(),
   ]);
   return {
-    series: seriesResult.results.map((point) => ({
-      timestamp_ms: Number(point.timestamp_ms),
-      power: number(point.power),
-      current: number(point.current),
-      voltage: number(point.voltage),
-      temperature: number(point.temperature),
-      soc: number(point.soc),
-    })),
-    latest: latest ? {
-      timestamp: latest.timestamp_ms,
-      mode: latest.mode,
-      ...batteryWithHealth(latest.battery_json, latest.battery_soc, latest.battery_soh),
-    } : null,
+    baselineAh: baseline?.capacity_ah ?? null,
+    recentRaw: recent.results.map((row) => row.soh_raw).reverse(),
+    lastReported: last?.soh_reported ?? null,
+    usableCount: count?.n ?? 0,
   };
 }
 
+function slotStateStatement(db, slot, row) {
+  return db.prepare(`
+    INSERT INTO slot_state (slot, identity_id, soc, ts_ms, connected, tracker_json, soh)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(slot) DO UPDATE SET
+      identity_id = excluded.identity_id,
+      soc = excluded.soc,
+      ts_ms = excluded.ts_ms,
+      connected = excluded.connected,
+      tracker_json = excluded.tracker_json,
+      soh = excluded.soh
+  `).bind(
+    slot, row.identityId ?? null, row.soc ?? null, row.tsMs ?? null, row.connected ? 1 : 0,
+    row.tracker ? JSON.stringify(row.tracker) : null, row.soh ?? null,
+  );
+}
+
+async function getSessionRow(db) {
+  return (await db.prepare('SELECT * FROM connection_sessions WHERE id = 1').first())
+    ?? { pending: 0, since_reading_id: null };
+}
+
+// Running state of both sensor slots. When the saved battery in a slot changed (renamed, picked from
+// the saved list, or a new one), the state is rebuilt from that battery's own last recorded data.
+async function loadEngineState(db, env, batterySpecs, identities, hasAnyReading) {
+  const stored = (await db.prepare(`
+    SELECT slot, identity_id, soc, ts_ms, connected, tracker_json, soh FROM slot_state
+  `).all()).results;
+  const bySlot = Object.fromEntries(stored.map((row) => [row.slot, row]));
+  const slots = {};
+  const soh = {};
+  const known = {};
+
+  for (const slot of [1, 2]) {
+    const identityId = batterySpecs[slot]?.identity_id ?? null;
+    const identity = identities.find((item) => item.id === identityId);
+    let row = bySlot[slot];
+    let rebuilt = false;
+    if (!row || row.identity_id !== identityId) {
+      const last = identityId ? await lastRecordedForIdentity(db, slot, identityId) : null;
+      const cycle = identityId ? await latestIdentityCycle(db, identityId) : null;
+      row = {
+        identity_id: identityId,
+        soc: last?.soc ?? (hasAnyReading ? null : (number(env.INITIAL_SOC) ?? 100)),
+        ts_ms: null,
+        connected: 0,
+        tracker_json: null,
+        soh: cycle?.soh_reported ?? last?.soh ?? null,
+      };
+      rebuilt = true;
+    }
+    let tracker = null;
+    try { tracker = row.tracker_json ? JSON.parse(row.tracker_json) : null; } catch { tracker = null; }
+    slots[slot] = {
+      capacityAh: capacityForBattery(env, slot, batterySpecs),
+      soc: number(row.soc),
+      tsMs: number(row.ts_ms),
+      tracker,
+      fullVoltage: number(identity?.full_voltage_v),
+      connected: Boolean(row.connected),
+    };
+    soh[slot] = number(row.soh);
+    known[slot] = !rebuilt && row.ts_ms !== null && row.ts_ms !== undefined;
+  }
+  return { state: { slots }, soh, known };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Saved batteries (by name) and the "same or new?" confirmation
+// ---------------------------------------------------------------------------------------------
+
+async function identityStats(db, identity, env) {
+  const slot = identity.slot;
+  const [last, cycle, cycleTotal] = await Promise.all([
+    lastRecordedForIdentity(db, slot, identity.id),
+    latestIdentityCycle(db, identity.id),
+    db.prepare('SELECT COUNT(*) AS n FROM battery_cycles WHERE identity_id = ?').bind(identity.id).first(),
+  ]);
+  return {
+    id: identity.id,
+    slot,
+    name: identity.name,
+    voltageV: identity.voltage_v,
+    capacityAh: identity.capacity_mah / 1000,
+    fullVoltageV: identity.full_voltage_v ?? null,
+    active: identity.active,
+    cycles: cycle?.cycles ?? 0,
+    loggedCycles: cycleTotal?.n ?? 0,
+    soh: cycle?.soh_reported ?? last?.soh ?? null,
+    measuredCapacityAh: cycle?.capacity_ah ?? null,
+    lastRecordedMs: last?.timestamp_ms ?? null,
+    lastSoc: last?.soc ?? null,
+    defaultCapacityAh: number(env?.[`BATTERY${slot}_CAPACITY_AH`]),
+  };
+}
+
+async function readSession(env) {
+  try {
+    const db = env.battery_management_db;
+    const [session, identities, specs] = await Promise.all([
+      getSessionRow(db), getBatteryIdentities(db), getBatterySpecs(db),
+    ]);
+    const stats = await Promise.all(identities.map((identity) => identityStats(db, identity, env)));
+    const byId = Object.fromEntries(stats.map((item) => [item.id, item]));
+    const describe = (id) => (id ? byId[id] ?? null : null);
+    return json({
+      pending: Boolean(session.pending),
+      reason: session.reason ?? null,
+      sinceReadingId: session.since_reading_id ?? null,
+      gapStartedMs: session.gap_started_ms ?? null,
+      resumedMs: session.resumed_ms ?? null,
+      gapSeconds: session.gap_started_ms && session.resumed_ms
+        ? Math.round((session.resumed_ms - session.gap_started_ms) / 1000) : null,
+      previous: { 1: describe(session.previous_identity1), 2: describe(session.previous_identity2) },
+      current: { 1: describe(specs[1]?.identity_id), 2: describe(specs[2]?.identity_id) },
+      saved: {
+        1: stats.filter((item) => item.slot === 1),
+        2: stats.filter((item) => item.slot === 2),
+      },
+    });
+  } catch (error) {
+    return json({ error: error.message || 'Could not read the connection state' }, 500);
+  }
+}
+
+function specStatement(db, slot, identity) {
+  const now = Date.now();
+  return db.prepare(`
+    INSERT INTO battery_specs (slot, name, voltage_v, capacity_mah, updated_at_ms, identity_id)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(slot) DO UPDATE SET
+      name = excluded.name,
+      voltage_v = excluded.voltage_v,
+      capacity_mah = excluded.capacity_mah,
+      updated_at_ms = excluded.updated_at_ms,
+      identity_id = excluded.identity_id
+  `).bind(slot, identity.name, identity.voltage_v, identity.capacity_mah, now, identity.id);
+}
+
+// Re-attribute the readings recorded while the question was open to the chosen battery and recompute
+// their SOC from that battery's own last recorded state (or from its rest voltage if it is new).
+async function reassignSlot(db, env, slot, identity, sinceReadingId, isNew) {
+  const column = `battery${slot}`;
+  const capacityAh = identity.capacity_mah / 1000;
+  const previousRecord = isNew ? null : await db.prepare(`
+    SELECT battery${slot}_soc AS soc, battery${slot}_soh AS soh
+    FROM readings
+    WHERE battery${slot}_identity_id = ? AND id < ? AND battery${slot}_soc IS NOT NULL
+    ORDER BY id DESC LIMIT 1
+  `).bind(identity.id, sinceReadingId).first();
+  const cycle = await latestIdentityCycle(db, identity.id);
+  const soh = cycle?.soh_reported ?? previousRecord?.soh ?? null;
+  const params = healthParams(env);
+
+  const rows = (await db.prepare(`
+    SELECT id, timestamp_ms, ${column}_json AS battery_json
+    FROM readings
+    WHERE id >= ?
+    ORDER BY id ASC
+    LIMIT ?
+  `).bind(sinceReadingId, RECHAIN_ROW_LIMIT).all()).results;
+
+  await db.prepare(`UPDATE readings SET ${column}_identity_id = ? WHERE id >= ?`).bind(identity.id, sinceReadingId).run();
+
+  let soc = number(previousRecord?.soc);
+  let previousTs = null;
+  let lastTs = null;
+  const statements = [];
+  for (const row of rows) {
+    const battery = JSON.parse(row.battery_json || '{}');
+    const reading = engineReading(battery);
+    if (!reading.connected) {
+      statements.push(db.prepare(`UPDATE readings SET ${column}_soc = NULL, ${column}_soh = NULL WHERE id = ?`).bind(row.id));
+    } else {
+      soc = Number.isFinite(reading.reportedSoc) ? clampPercent(reading.reportedSoc) : stepSoc({
+        prevSoc: soc,
+        dtSeconds: previousTs === null ? 0 : (row.timestamp_ms - previousTs) / 1000,
+        voltage: reading.voltage,
+        current: reading.current,
+        capacityAh,
+        fullVoltage: number(identity.full_voltage_v),
+      }, params);
+      statements.push(db.prepare(`UPDATE readings SET ${column}_soc = ?, ${column}_soh = ? WHERE id = ?`).bind(soc, soh, row.id));
+    }
+    previousTs = row.timestamp_ms;
+    lastTs = row.timestamp_ms;
+  }
+  for (let start = 0; start < statements.length; start += 100) {
+    await db.batch(statements.slice(start, start + 100));
+  }
+  await slotStateStatement(db, slot, {
+    identityId: identity.id, soc, tsMs: lastTs, connected: lastTs !== null, tracker: null, soh,
+  }).run();
+  return { rechained: rows.length, truncated: rows.length === RECHAIN_ROW_LIMIT };
+}
+
+function validateNewBattery(choice, slot) {
+  const name = String(choice.name || '').trim();
+  const voltageV = number(choice.voltageV) ?? 12;
+  const capacityAh = number(choice.capacityAh);
+  if (!name || name.length > 60) return { error: `Slot ${slot}: enter a battery name up to 60 characters` };
+  if (voltageV <= 0 || voltageV > 1000) return { error: `Slot ${slot}: voltage must be greater than 0 and at most 1000 V` };
+  if (capacityAh === null || capacityAh <= 0 || capacityAh > 1000) {
+    return { error: `Slot ${slot}: capacity must be greater than 0 and at most 1000 Ah` };
+  }
+  return { name, voltageV, capacityMah: capacityAh * 1000 };
+}
+
+async function findOrCreateIdentity(db, slot, details) {
+  const existing = await db.prepare(`
+    SELECT id, slot, name, voltage_v, capacity_mah, created_at_ms, full_voltage_v
+    FROM battery_identities
+    WHERE slot = ? AND LOWER(name) = LOWER(?)
+    ORDER BY id DESC LIMIT 1
+  `).bind(slot, details.name).first();
+  if (existing) {
+    await db.prepare(`UPDATE battery_identities SET voltage_v = ?, capacity_mah = ? WHERE id = ?`)
+      .bind(details.voltageV, details.capacityMah, existing.id).run();
+    return { identity: { ...existing, voltage_v: details.voltageV, capacity_mah: details.capacityMah }, created: false };
+  }
+  const result = await db.prepare(`
+    INSERT INTO battery_identities (slot, name, voltage_v, capacity_mah, created_at_ms)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(slot, details.name, details.voltageV, details.capacityMah, Date.now()).run();
+  return {
+    identity: {
+      id: result.meta.last_row_id, slot, name: details.name, voltage_v: details.voltageV,
+      capacity_mah: details.capacityMah, created_at_ms: Date.now(), full_voltage_v: null,
+    },
+    created: true,
+  };
+}
+
+async function getIdentity(db, id) {
+  return db.prepare(`
+    SELECT id, slot, name, voltage_v, capacity_mah, created_at_ms, full_voltage_v
+    FROM battery_identities WHERE id = ?
+  `).bind(id).first();
+}
+
+// POST /api/session/resolve
+// body: { slots: { 1: { action: 'same' | 'saved' | 'new', identityId?, name?, capacityAh?, voltageV? }, 2: {...} } }
+async function resolveSession(request, env) {
+  try {
+    const db = env.battery_management_db;
+    const session = await getSessionRow(db);
+    if (!session.pending) return json({ error: 'No battery confirmation is waiting' }, 409);
+    const body = await request.json();
+    const specs = await getBatterySpecs(db);
+    const changes = {};
+
+    // Validate everything first so a bad answer for slot 2 cannot leave slot 1 half applied.
+    for (const slot of [1, 2]) {
+      const choice = body?.slots?.[slot] ?? { action: 'same' };
+      if (choice.action === 'same') continue;
+      if (choice.action === 'saved') {
+        const identity = await getIdentity(db, Number(choice.identityId));
+        if (!identity || identity.slot !== slot) return json({ error: `Slot ${slot}: choose a battery saved for this slot` }, 400);
+        changes[slot] = { identity, isNew: false };
+      } else if (choice.action === 'new') {
+        const details = validateNewBattery(choice, slot);
+        if (details.error) return json({ error: details.error }, 400);
+        changes[slot] = { details, isNew: true };
+      } else {
+        return json({ error: `Slot ${slot}: unknown action` }, 400);
+      }
+    }
+
+    const applied = {};
+    for (const slot of [1, 2]) {
+      const change = changes[slot];
+      if (!change) continue;
+      let identity = change.identity;
+      let isNew = change.isNew;
+      if (change.isNew) {
+        const found = await findOrCreateIdentity(db, slot, change.details);
+        identity = found.identity;
+        isNew = found.created;
+      }
+      if (identity.id === (specs[slot]?.identity_id ?? null)) {
+        applied[slot] = { name: identity.name, unchanged: true };
+        continue;
+      }
+      await specStatement(db, slot, identity).run();
+      const outcome = await reassignSlot(db, env, slot, identity, session.since_reading_id, isNew);
+      applied[slot] = { name: identity.name, identityId: identity.id, createdIdentity: isNew, ...outcome };
+    }
+
+    await db.prepare(`UPDATE connection_sessions SET pending = 0 WHERE id = 1`).run();
+    return json({ success: true, applied });
+  } catch (error) {
+    return json({ error: error.message || 'Could not apply the battery confirmation' }, 400);
+  }
+}
+
+// POST /api/batteries/activate { slot, identityId }: put a saved battery back into its slot.
+async function activateBattery(request, env) {
+  try {
+    const db = env.battery_management_db;
+    const body = await request.json();
+    const slot = Number(body.slot);
+    const identity = await getIdentity(db, Number(body.identityId));
+    if (![1, 2].includes(slot) || !identity || identity.slot !== slot) {
+      return json({ error: 'Choose a battery that was saved for this slot' }, 400);
+    }
+    await specStatement(db, slot, identity).run();
+    return json({ success: true, battery: { slot, name: identity.name, identity_id: identity.id } });
+  } catch (error) {
+    return json({ error: error.message || 'Could not select the saved battery' }, 400);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Battery specifications
+// ---------------------------------------------------------------------------------------------
+
 async function readBatteries(env) {
   try {
-    const batteries = await getBatterySpecs(env.battery_management_db);
-    return json({ batteries: Object.values(batteries) });
+    const db = env.battery_management_db;
+    const [batteries, identities] = await Promise.all([getBatterySpecs(db), getBatteryIdentities(db)]);
+    const saved = await Promise.all(identities.map((identity) => identityStats(db, identity, env)));
+    return json({ batteries: Object.values(batteries), saved });
   } catch (error) {
     return json({ error: error.message || 'Could not read battery specifications' }, 500);
   }
@@ -205,19 +562,24 @@ async function saveBattery(request, env) {
     const db = env.battery_management_db;
     const currentBattery = (await getBatterySpecs(db))[slot];
     let identityId = currentBattery?.identity_id;
-    const createdIdentity = !currentBattery || currentBattery.name !== name || !identityId;
-    if (createdIdentity) {
-      const identity = await db.prepare(`
-        INSERT INTO battery_identities (slot, name, voltage_v, capacity_mah, created_at_ms)
-        VALUES (?, ?, ?, ?, ?)
-      `).bind(slot, name, voltageV, capacityMah, Date.now()).run();
-      identityId = identity.meta.last_row_id;
-    } else {
+    let createdIdentity = false;
+    let switchedToSaved = false;
+    let capacityChanged = false;
+
+    if (currentBattery && identityId && currentBattery.name === name) {
+      capacityChanged = Math.abs(currentBattery.capacity_mah - capacityMah) > 1e-6;
       await db.prepare(`
         UPDATE battery_identities
         SET voltage_v = ?, capacity_mah = ?
         WHERE id = ?
       `).bind(voltageV, capacityMah, identityId).run();
+    } else {
+      // A name that is already saved for this slot brings that battery's history back instead of
+      // starting a new one; only an unseen name creates a new battery identity.
+      const found = await findOrCreateIdentity(db, slot, { name, voltageV, capacityMah });
+      identityId = found.identity.id;
+      createdIdentity = found.created;
+      switchedToSaved = !found.created;
     }
 
     await db.prepare(`
@@ -234,6 +596,8 @@ async function saveBattery(request, env) {
     return json({
       success: true,
       createdIdentity,
+      switchedToSaved,
+      capacityChanged,
       battery: { slot, name, voltage_v: voltageV, capacity_mah: capacityMah, identity_id: identityId },
     });
   } catch (error) {
@@ -259,16 +623,84 @@ async function deleteBattery(request, env, slot) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// History (Database reader)
+// ---------------------------------------------------------------------------------------------
+
+function fillGaps(points, bucketMs, keys) {
+  const filled = [];
+  for (let index = 0; index < points.length; index += 1) {
+    if (index > 0 && points[index].timestamp_ms - points[index - 1].timestamp_ms > bucketMs * 3) {
+      filled.push({
+        timestamp_ms: points[index - 1].timestamp_ms + bucketMs,
+        ...Object.fromEntries(keys.map((key) => [key, null])),
+      });
+    }
+    filled.push(points[index]);
+  }
+  return filled;
+}
+
+async function readBatteryIdentityHistory(db, identity, startMs, endMs, bucketMs) {
+  if (!identity) return { series: [], latest: null };
+  const slot = identity.slot;
+  const identityColumn = `battery${slot}_identity_id`;
+  const batteryColumn = `battery${slot}_json`;
+  const socColumn = `battery${slot}_soc`;
+  const sohColumn = `battery${slot}_soh`;
+  const [seriesResult, latest] = await Promise.all([
+    db.prepare(`
+      SELECT CAST(timestamp_ms / ? AS INTEGER) * ? AS timestamp_ms,
+             AVG(json_extract(${batteryColumn}, '$.power')) AS power,
+             AVG(json_extract(${batteryColumn}, '$.current')) AS current,
+             AVG(json_extract(${batteryColumn}, '$.voltage')) AS voltage,
+             AVG(json_extract(${batteryColumn}, '$.temperature')) AS temperature,
+             AVG(${socColumn}) AS soc,
+             AVG(${sohColumn}) AS soh
+      FROM readings
+      WHERE timestamp_ms >= ? AND timestamp_ms <= ? AND ${identityColumn} = ?
+      GROUP BY CAST(timestamp_ms / ? AS INTEGER)
+      ORDER BY timestamp_ms ASC
+    `).bind(bucketMs, bucketMs, startMs, endMs, identity.id, bucketMs).all(),
+    db.prepare(`
+      SELECT timestamp_ms, mode, ${batteryColumn} AS battery_json,
+             ${socColumn} AS battery_soc, ${sohColumn} AS battery_soh
+      FROM readings
+      WHERE timestamp_ms >= ? AND timestamp_ms <= ? AND ${identityColumn} = ?
+      ORDER BY timestamp_ms DESC
+      LIMIT 1
+    `).bind(startMs, endMs, identity.id).first(),
+  ]);
+  const series = seriesResult.results.map((point) => ({
+    timestamp_ms: Number(point.timestamp_ms),
+    power: number(point.power),
+    current: number(point.current),
+    voltage: number(point.voltage),
+    temperature: number(point.temperature),
+    soc: number(point.soc),
+    soh: number(point.soh),
+  }));
+  return {
+    series: fillGaps(series, bucketMs, ['power', 'current', 'voltage', 'temperature', 'soc', 'soh']),
+    latest: latest ? {
+      timestamp: latest.timestamp_ms,
+      mode: latest.mode,
+      ...batteryWithHealth(latest.battery_json, latest.battery_soc, latest.battery_soh),
+    } : null,
+  };
+}
+
+const HISTORY_RANGES = {
+  '1h': 60 * 60 * 1000,
+  '6h': 6 * 60 * 60 * 1000,
+  '24h': DAY_MS,
+  '7d': 7 * DAY_MS,
+};
+
 async function readHistory(request, env) {
   try {
-    const ranges = {
-      '1h': 60 * 60 * 1000,
-      '6h': 6 * 60 * 60 * 1000,
-      '24h': 24 * 60 * 60 * 1000,
-      '7d': 7 * 24 * 60 * 60 * 1000,
-    };
-    const range = new URL(request.url).searchParams.get('range');
     const searchParams = new URL(request.url).searchParams;
+    const range = resolveRange(searchParams, HISTORY_RANGES, '24h');
     const requestedTableSlot = searchParams.get('slot') === '2' ? 2 : 1;
     const db = env.battery_management_db;
     const identities = await getBatteryIdentities(db);
@@ -286,7 +718,7 @@ async function readHistory(request, env) {
       || null;
     const tableSlot = tableIdentity?.slot ?? requestedTableSlot;
     const tableIdentityFilter = tableIdentity ? ` AND battery${tableSlot}_identity_id = ?` : '';
-    const sortBy = ['latest', 'voltage', 'current', 'power', 'temperature', 'soc']
+    const sortBy = ['latest', 'voltage', 'current', 'power', 'temperature', 'soc', 'soh']
       .includes(searchParams.get('sort')) ? searchParams.get('sort') : 'latest';
     const sortOrder = searchParams.get('order') === 'asc' ? 'ASC' : 'DESC';
     const sortColumns = {
@@ -296,83 +728,32 @@ async function readHistory(request, env) {
       power: `json_extract(battery${tableSlot}_json, '$.power')`,
       temperature: `json_extract(battery${tableSlot}_json, '$.temperature')`,
       soc: `battery${tableSlot}_soc`,
+      soh: `battery${tableSlot}_soh`,
     };
-    const rangeMs = ranges[range] ?? ranges['24h'];
-    const bucketMs = Math.max(5000, Math.ceil(rangeMs / (1200 * 5000)) * 5000);
-    const startMs = Date.now() - rangeMs;
-    const [seriesResult, readingsResult, batterySpecs, leftIdentityHistory, rightIdentityHistory] = await Promise.all([
+    const bucketMs = Math.max(5000, Math.ceil(range.rangeMs / (1200 * 5000)) * 5000);
+    const tableBinds = tableIdentity ? [tableIdentity.id] : [];
+    const [countResult, readingsResult, batterySpecs, leftIdentityHistory, rightIdentityHistory] = await Promise.all([
       db.prepare(`
-        SELECT CAST(timestamp_ms / ? AS INTEGER) * ? AS timestamp_ms,
-               COUNT(*) AS samples,
-               AVG(json_extract(battery1_json, '$.voltage')) AS battery1Voltage,
-               AVG(json_extract(battery1_json, '$.current')) AS battery1Current,
-               AVG(json_extract(battery1_json, '$.power')) AS battery1Power,
-               AVG(json_extract(battery1_json, '$.temperature')) AS battery1Temperature,
-               AVG(battery1_soc) AS battery1Soc,
-                 AVG(CASE WHEN json_extract(battery1_json, '$.connected') = 1
-                   THEN CAST(json_extract(battery1_json, '$.current') AS REAL) END) AS battery1NetCurrentA,
-                 AVG(CASE WHEN json_extract(battery1_json, '$.connected') = 1
-                   THEN COALESCE(json_extract(battery1_json, '$.soc_kalman'),
-                         json_extract(battery1_json, '$.soc_coulomb'),
-                         json_extract(battery1_json, '$.soc_ocv'),
-                         json_extract(battery1_json, '$.soc')) END) AS battery1ReportedSoc,
-                 MAX(CASE WHEN json_extract(battery1_json, '$.connected') = 1 THEN 1 ELSE 0 END) AS battery1Connected,
-               AVG(json_extract(battery2_json, '$.voltage')) AS battery2Voltage,
-               AVG(json_extract(battery2_json, '$.current')) AS battery2Current,
-               AVG(json_extract(battery2_json, '$.power')) AS battery2Power,
-               AVG(json_extract(battery2_json, '$.temperature')) AS battery2Temperature,
-                 AVG(battery2_soc) AS battery2Soc,
-                 AVG(CASE WHEN json_extract(battery2_json, '$.connected') = 1
-                   THEN CAST(json_extract(battery2_json, '$.current') AS REAL) END) AS battery2NetCurrentA,
-                 AVG(CASE WHEN json_extract(battery2_json, '$.connected') = 1
-                   THEN COALESCE(json_extract(battery2_json, '$.soc_kalman'),
-                         json_extract(battery2_json, '$.soc_coulomb'),
-                         json_extract(battery2_json, '$.soc_ocv'),
-                         json_extract(battery2_json, '$.soc')) END) AS battery2ReportedSoc,
-                 MAX(CASE WHEN json_extract(battery2_json, '$.connected') = 1 THEN 1 ELSE 0 END) AS battery2Connected
+        SELECT COUNT(*) AS samples
         FROM readings
-        WHERE timestamp_ms >= ?${tableIdentityFilter}
-        GROUP BY CAST(timestamp_ms / ? AS INTEGER)
-        ORDER BY 1 ASC
-      `).bind(
-        bucketMs,
-        bucketMs,
-        startMs,
-        ...(tableIdentity ? [tableIdentity.id] : []),
-        bucketMs,
-      ).all(),
+        WHERE timestamp_ms >= ? AND timestamp_ms <= ?${tableIdentityFilter}
+      `).bind(range.startMs, range.endMs, ...tableBinds).first(),
       db.prepare(`
          SELECT id, capture_request_id, battery1_identity_id, battery2_identity_id,
            timestamp_ms, mode, switching, wifi_json, system_json,
                battery1_json, battery2_json, battery1_soc, battery2_soc,
                battery1_soh, battery2_soh
         FROM readings
-        WHERE timestamp_ms >= ?${tableIdentityFilter}
+        WHERE timestamp_ms >= ? AND timestamp_ms <= ?${tableIdentityFilter}
         ORDER BY ${sortBy === 'latest'
           ? 'timestamp_ms DESC'
           : `${sortColumns[sortBy]} IS NULL ASC, ${sortColumns[sortBy]} ${sortOrder}`}, timestamp_ms DESC
         LIMIT 100
-      `).bind(
-        startMs,
-        ...(tableIdentity ? [tableIdentity.id] : []),
-      ).all(),
+      `).bind(range.startMs, range.endMs, ...tableBinds).all(),
       getBatterySpecs(db),
-      readBatteryIdentityHistory(db, leftIdentity, startMs, bucketMs),
-      readBatteryIdentityHistory(db, rightIdentity, startMs, bucketMs),
+      readBatteryIdentityHistory(db, leftIdentity, range.startMs, range.endMs, bucketMs),
+      readBatteryIdentityHistory(db, rightIdentity, range.startMs, range.endMs, bucketMs),
     ]);
-    const series = seriesResult.results.map((point) => ({
-      ...point,
-      timestamp_ms: Number(point.timestamp_ms),
-      battery1NetCurrentA: number(point.battery1NetCurrentA),
-      battery1Soc: number(point.battery1Soc),
-      battery1ReportedSoc: number(point.battery1ReportedSoc),
-      battery1Connected: point.battery1Connected === 1,
-      battery2NetCurrentA: number(point.battery2NetCurrentA),
-      battery2Soc: number(point.battery2Soc),
-      battery2ReportedSoc: number(point.battery2ReportedSoc),
-      battery2Connected: point.battery2Connected === 1,
-      intervalMs: bucketMs,
-    }));
     const identityNames = Object.fromEntries(identities.map((identity) => [identity.id, identity.name]));
     const readings = readingsResult.results.map((row) => ({
       id: row.id,
@@ -395,11 +776,11 @@ async function readHistory(request, env) {
         identityName: identityNames[row.battery2_identity_id] || '',
       },
     }));
-    recalculateSocForCapacity(series, 1, capacityForBattery(env, 1, batterySpecs));
-    recalculateSocForCapacity(series, 2, capacityForBattery(env, 2, batterySpecs));
 
     return json({
-      range: range in ranges ? range : '24h',
+      range: range.key,
+      startMs: range.startMs,
+      endMs: range.endMs,
       tableSlot,
       tableSort: sortBy,
       tableOrder: sortOrder.toLowerCase(),
@@ -413,7 +794,7 @@ async function readHistory(request, env) {
         right: rightIdentityHistory,
       },
       intervalMs: bucketMs,
-      series,
+      sampleCount: countResult?.samples ?? 0,
       readings,
       batteries: Object.values(batterySpecs),
       batteryIdentities: identities,
@@ -424,235 +805,283 @@ async function readHistory(request, env) {
   }
 }
 
-function batteryAnalytics(series, index) {
+// ---------------------------------------------------------------------------------------------
+// CSV export (same columns as the Google Sheet and Dataset 2)
+// ---------------------------------------------------------------------------------------------
+
+function csvStream(produceLines, filename) {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        controller.enqueue(encoder.encode(`${CSV_HEADERS.join(',')}\r\n`));
+        for await (const chunk of produceLines()) controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+async function exportReadingsCsv(request, env) {
+  try {
+    const db = env.battery_management_db;
+    const searchParams = new URL(request.url).searchParams;
+    const range = resolveRange(searchParams, HISTORY_RANGES, '24h');
+    const identities = await getBatteryIdentities(db);
+    const identityNames = Object.fromEntries(identities.map((identity) => [identity.id, identity.name]));
+    const selected = identities.find((identity) => identity.id === Number(searchParams.get('batteryId')));
+    const filter = selected ? ` AND battery${selected.slot}_identity_id = ?` : '';
+    const timeZone = env.CSV_TIME_ZONE || 'Asia/Manila';
+    const filename = `battery-readings${selected ? `-${selected.name.replace(/[^\w.-]+/g, '_')}` : ''}.csv`;
+
+    return csvStream(async function* produce() {
+      let lastId = 0;
+      for (;;) {
+        const { results } = await db.prepare(`
+          SELECT id, capture_request_id, battery1_identity_id, battery2_identity_id,
+                 timestamp_ms, mode, switching, wifi_json, system_json,
+                 battery1_json, battery2_json, battery1_soc, battery2_soc, battery1_soh, battery2_soh
+          FROM readings
+          WHERE id > ? AND timestamp_ms >= ? AND timestamp_ms <= ?${filter}
+          ORDER BY id ASC
+          LIMIT 2000
+        `).bind(lastId, range.startMs, range.endMs, ...(selected ? [selected.id] : [])).all();
+        if (results.length === 0) return;
+        yield `${results.map((row) => readingToCsvLine({
+          id: row.id,
+          timestamp_ms: row.timestamp_ms,
+          mode: row.mode,
+          switching: Boolean(row.switching),
+          wifi: JSON.parse(row.wifi_json || '{}'),
+          system: JSON.parse(row.system_json || '{}'),
+          captureRequestId: row.capture_request_id,
+          battery1: {
+            ...batteryWithHealth(row.battery1_json, row.battery1_soc, row.battery1_soh),
+            identityId: row.battery1_identity_id, identityName: identityNames[row.battery1_identity_id] || '',
+          },
+          battery2: {
+            ...batteryWithHealth(row.battery2_json, row.battery2_soc, row.battery2_soh),
+            identityId: row.battery2_identity_id, identityName: identityNames[row.battery2_identity_id] || '',
+          },
+        }, timeZone)).join('\r\n')}\r\n`;
+        lastId = results.at(-1).id;
+      }
+    }, filename);
+  } catch (error) {
+    return json({ error: error.message || 'Could not export readings' }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Analytics + SOH forecast
+// ---------------------------------------------------------------------------------------------
+
+const MIN_RELIABLE_SOC_DECLINE_PERCENT = 0.1;
+const MIN_DISCHARGE_CURRENT_A = 0.02;
+
+// Battery 1 powers the ESP32 in every mode, so it discharges whenever its net current is negative,
+// including while it is the "charging" battery. Battery 2 only discharges while Battery 1 charges.
+// Discharge is therefore detected from the sign of the measured net current, never from the mode.
+function batteryAnalytics(series, index, capacityAh) {
   const batteryKey = `battery${index}`;
-  const dischargeMode = `Battery${index === 1 ? 2 : 1} Charging`;
-  const chargeMode = `Battery${index} Charging`;
   let dischargeHours = 0;
-  let socObservationHours = 0;
-  let netSocChange = 0;
   let dischargedAmpHours = 0;
+  let socDeclinePercent = 0;
 
   for (let pointIndex = 1; pointIndex < series.length; pointIndex += 1) {
     const previous = series[pointIndex - 1];
     const current = series[pointIndex];
     const elapsedHours = (current.timestamp_ms - previous.timestamp_ms) / 3600000;
+    const previousNet = previous[`${batteryKey}NetCurrentA`];
+    const currentNet = current[`${batteryKey}NetCurrentA`];
     if (
-      (index !== 1 && (previous.mode !== dischargeMode || current.mode !== dischargeMode))
-      || previous[`${batteryKey}Connected`] !== true
+      previous[`${batteryKey}Connected`] !== true
       || current[`${batteryKey}Connected`] !== true
       || !Number.isFinite(previous[`${batteryKey}Soc`])
       || !Number.isFinite(current[`${batteryKey}Soc`])
+      || !Number.isFinite(previousNet)
+      || !Number.isFinite(currentNet)
+      || isRestMode(previous.mode)
+      || isRestMode(current.mode)
       || elapsedHours <= 0
       || elapsedHours > (current.intervalMs * 3) / 3600000
     ) continue;
 
-    const intervalSocChange = current[`${batteryKey}Soc`] - previous[`${batteryKey}Soc`];
-    socObservationHours += elapsedHours;
-    netSocChange += intervalSocChange;
-    if (intervalSocChange >= 0) continue;
-
-    if (!Number.isFinite(previous[`${batteryKey}CurrentA`])
-      || !Number.isFinite(current[`${batteryKey}CurrentA`])) continue;
+    // Both ends must be discharging: an interval that straddles a charge -> discharge change is
+    // skipped instead of being counted as a whole interval of discharge.
+    if (previousNet > -MIN_DISCHARGE_CURRENT_A || currentNet > -MIN_DISCHARGE_CURRENT_A) continue;
+    const averageNet = (previousNet + currentNet) / 2;
 
     dischargeHours += elapsedHours;
-    dischargedAmpHours += (
-      previous[`${batteryKey}CurrentA`] + current[`${batteryKey}CurrentA`]
-    ) / 2 * elapsedHours;
+    dischargedAmpHours += -averageNet * elapsedHours;
+    socDeclinePercent += Math.max(0, previous[`${batteryKey}Soc`] - current[`${batteryKey}Soc`]);
   }
 
   const averageDischargeA = dischargeHours > 0 ? dischargedAmpHours / dischargeHours : null;
-  const drainPercentPerHour = socObservationHours > 0 && netSocChange < 0
-    ? -netSocChange / socObservationHours
-    : null;
+  const drainFromSoc = dischargeHours > 0 && socDeclinePercent >= MIN_RELIABLE_SOC_DECLINE_PERCENT
+    ? socDeclinePercent / dischargeHours : null;
+  const drainFromCurrent = averageDischargeA !== null && capacityAh > 0
+    ? (averageDischargeA / capacityAh) * 100 : null;
+  const drainPercentPerHour = drainFromSoc ?? drainFromCurrent;
   const latestSample = [...series].reverse().find((point) => (
     point[`${batteryKey}Connected`] === true
     && Number.isFinite(point[`${batteryKey}Soc`])
   ));
-  const latestSohSample = [...series].reverse().find((point) => (
-    point[`${batteryKey}Connected`] === true
-    && Number.isFinite(point[`${batteryKey}Soh`])
-  ));
-  const hoursToEmpty = drainPercentPerHour > 0 && latestSample
-    ? latestSample[`${batteryKey}Soc`] / drainPercentPerHour
-    : null;
-
-  const measuredCycleDrops = [];
-  let completedChargeCycles = 0;
-  let cycle = null;
-  for (let pointIndex = 0; pointIndex < series.length; pointIndex += 1) {
-    const point = series[pointIndex];
-    if (point.mode === chargeMode) {
-      if (!cycle) {
-        cycle = {
-          startMs: point.timestamp_ms,
-          endMs: point.timestamp_ms,
-          startSoh: point[`${batteryKey}Soh`],
-          endSoh: point[`${batteryKey}Soh`],
-          sohSampleCount: point[`${batteryKey}Soh`] === null ? 0 : 1,
-          startedInRange: pointIndex > 0 && series[pointIndex - 1].mode !== chargeMode,
-          startSoc: point[`${batteryKey}Soc`],
-          endSoc: point[`${batteryKey}Soc`],
-        };
-      } else {
-        cycle.endMs = point.timestamp_ms;
-        if (point[`${batteryKey}Soh`] !== null) {
-          if (cycle.sohSampleCount === 0) cycle.startSoh = point[`${batteryKey}Soh`];
-          cycle.endSoh = point[`${batteryKey}Soh`];
-          cycle.sohSampleCount += 1;
-        }
-        cycle.endSoc = point[`${batteryKey}Soc`] ?? cycle.endSoc;
-      }
-    } else if (cycle) {
-      if (cycle.startedInRange) completedChargeCycles += 1;
-      if (cycle.startedInRange && cycle.sohSampleCount >= 2
-        && cycle.startSoh !== null && cycle.startSoh !== undefined
-        && cycle.endSoh !== null && cycle.endSoh !== undefined) {
-        measuredCycleDrops.push(Math.max(0, cycle.startSoh - cycle.endSoh));
-      }
-      cycle = null;
-    }
-  }
-
-  const sohDropPerCycle = measuredCycleDrops.length > 0
-    ? measuredCycleDrops.reduce((total, drop) => total + drop, 0) / measuredCycleDrops.length
-    : null;
 
   return {
     averageDischargeA,
+    dischargeHours,
     drainPercentPerHour,
+    drainSource: drainFromSoc !== null ? 'soc' : drainFromCurrent !== null ? 'current' : null,
     minutesPerPercentDrop: drainPercentPerHour > 0 ? 60 / drainPercentPerHour : null,
-    socObservationHours,
+    socObservationHours: dischargeHours,
+    socDeclinePercent,
     latestSoc: latestSample?.[`${batteryKey}Soc`] ?? null,
-    latestSoh: latestSohSample?.[`${batteryKey}Soh`] ?? null,
-    hoursToEmpty,
-    completedChargeCycles,
-    measuredSohCycleCount: measuredCycleDrops.length,
-    predictedSohDropNextCycle: sohDropPerCycle,
-    sohForecastConfidence: measuredCycleDrops.length >= 5
-      ? 'higher'
-      : measuredCycleDrops.length >= 2
-        ? 'limited'
-        : measuredCycleDrops.length === 1
-          ? 'very limited'
-          : 'unavailable',
+    hoursToEmpty: drainPercentPerHour > 0 && latestSample ? latestSample[`${batteryKey}Soc`] / drainPercentPerHour : null,
   };
 }
 
-function recalculateSocForCapacity(series, index, capacityAh) {
-  const socKey = `battery${index}Soc`;
-  const reportedSocKey = `battery${index}ReportedSoc`;
-  const currentKey = `battery${index}NetCurrentA`;
-  const connectedKey = `battery${index}Connected`;
-  let previousSoc = null;
-  let previousTimestamp = null;
-
-  for (const point of series) {
-    if (!point[connectedKey]) {
-      point[socKey] = null;
-      previousSoc = null;
-      previousTimestamp = null;
-      continue;
-    }
-
-    const reportedSoc = point[reportedSocKey];
-    if (Number.isFinite(reportedSoc)) {
-      previousSoc = clampPercent(reportedSoc);
-      point[socKey] = previousSoc;
-      previousTimestamp = point.timestamp_ms;
-      continue;
-    }
-
-    if (previousSoc === null) {
-      previousSoc = Number.isFinite(point[socKey]) ? clampPercent(point[socKey]) : null;
-    } else {
-      const elapsedHours = (point.timestamp_ms - previousTimestamp) / 3600000;
-      const currentA = point[currentKey];
-      if (elapsedHours > 0 && elapsedHours <= (point.intervalMs * 3) / 3600000
-        && Number.isFinite(currentA) && capacityAh > 0) {
-        previousSoc = clampPercent(previousSoc + currentA * elapsedHours / capacityAh * 100);
-      } else if (Number.isFinite(point[socKey])) {
-        previousSoc = clampPercent(point[socKey]);
-      }
-    }
-
-    point[socKey] = previousSoc;
-    previousTimestamp = point.timestamp_ms;
-  }
+// Completed cycles carry exact hours / Ah / depth-of-discharge, so when the period contains any they
+// give a truer discharge rate than the sparse samples between them.
+function withCycleRates(base, cycles, range) {
+  const inRange = cycles.filter((cycle) => cycle.ended_at_ms >= range.startMs && cycle.ended_at_ms <= range.endMs);
+  const hours = inRange.reduce((total, cycle) => total + cycle.hours, 0);
+  if (inRange.length === 0 || hours <= 0) return base;
+  const ah = inRange.reduce((total, cycle) => total + cycle.discharged_ah, 0);
+  const dod = inRange.reduce((total, cycle) => total + cycle.dod_percent, 0);
+  const drain = dod / hours;
+  return {
+    ...base,
+    averageDischargeA: ah / hours,
+    dischargeHours: hours,
+    drainPercentPerHour: drain,
+    drainSource: 'cycles',
+    minutesPerPercentDrop: drain > 0 ? 60 / drain : null,
+    socObservationHours: hours,
+    socDeclinePercent: dod,
+    hoursToEmpty: drain > 0 && Number.isFinite(base.latestSoc) ? base.latestSoc / drain : base.hoursToEmpty,
+  };
 }
 
-async function readBatteryIdentityAnalytics(db, identity, startMs, bucketMs) {
+async function loadCycles(db, identityId, limit = 5000) {
+  const { results } = await db.prepare(`
+    SELECT id, cycle_number, started_at_ms, ended_at_ms, hours, avg_load_a, discharged_ah,
+           soc_start, soc_final, soc_final_source, dod_percent, capacity_ah, soh_raw, soh_reported
+    FROM battery_cycles
+    WHERE identity_id = ?
+    ORDER BY id DESC
+    LIMIT ?
+  `).bind(identityId, limit).all();
+  return results.reverse();
+}
+
+function forecastFromCycles(cycles) {
+  return buildForecast(cycles
+    .filter((cycle) => cycle.soh_reported !== null && cycle.soh_raw !== null)
+    .map((cycle, index) => ({
+      cycle: cycle.cycle_number ?? index + 1,
+      sohRaw: cycle.soh_raw,
+      sohReported: cycle.soh_reported,
+      endedMs: cycle.ended_at_ms,
+    })));
+}
+
+async function readBatteryIdentityAnalytics(db, identity, range, bucketMs, bucketCount) {
   if (!identity) return null;
   const slot = identity.slot;
   const batteryColumn = `battery${slot}_json`;
   const identityColumn = `battery${slot}_identity_id`;
+  const identityTimestampIndex = `readings_battery${slot}_timestamp_idx`;
   const socColumn = `battery${slot}_soc`;
-  const sohColumn = `battery${slot}_soh`;
   const result = await db.prepare(`
-    WITH recent AS (
-      SELECT timestamp_ms,
-             CAST(timestamp_ms / ? AS INTEGER) AS bucket,
-             mode,
-             ${batteryColumn} AS battery_json,
-             ${socColumn} AS battery_soc,
-             ${sohColumn} AS battery_soh
-      FROM readings
-      WHERE timestamp_ms >= ? AND ${identityColumn} = ?
+    WITH RECURSIVE buckets(bucket) AS (
+      SELECT 0
+      UNION ALL
+      SELECT bucket + 1 FROM buckets WHERE bucket + 1 < ?
     ),
-    bucket_modes AS (
-      SELECT bucket, mode,
-             ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY timestamp_ms DESC) AS row_num
-      FROM recent
+    sampled AS (
+      SELECT bucket,
+             (
+               SELECT id
+               FROM readings INDEXED BY ${identityTimestampIndex}
+               WHERE ${identityColumn} = ?
+                 AND timestamp_ms >= ? + buckets.bucket * ?
+                 AND timestamp_ms < ? + (buckets.bucket + 1) * ?
+               ORDER BY timestamp_ms DESC, id DESC
+               LIMIT 1
+             ) AS reading_id
+      FROM buckets
     )
-    SELECT CAST(recent.bucket AS INTEGER) * ? AS timestamp_ms,
-           MAX(CASE WHEN bucket_modes.row_num = 1 THEN recent.mode END) AS mode,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN ABS(CAST(json_extract(recent.battery_json, '$.current') AS REAL)) END) AS current_a,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN CAST(json_extract(recent.battery_json, '$.current') AS REAL) END) AS net_current_a,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN recent.battery_soc END) AS soc,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN COALESCE(json_extract(recent.battery_json, '$.soc_kalman'),
-                     json_extract(recent.battery_json, '$.soc_coulomb'),
-                     json_extract(recent.battery_json, '$.soc_ocv'),
-                     json_extract(recent.battery_json, '$.soc')) END) AS reported_soc,
-           AVG(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1
-               THEN recent.battery_soh END) AS soh,
-           MAX(CASE WHEN json_extract(recent.battery_json, '$.connected') = 1 THEN 1 ELSE 0 END) AS connected
-    FROM recent
-    JOIN bucket_modes ON bucket_modes.bucket = recent.bucket AND bucket_modes.row_num = 1
-    GROUP BY recent.bucket
-    ORDER BY recent.bucket ASC
-  `).bind(bucketMs, startMs, identity.id, bucketMs).all();
+    SELECT readings.timestamp_ms,
+           readings.mode,
+           CASE WHEN json_extract(readings.${batteryColumn}, '$.connected') = 1
+             THEN CAST(json_extract(readings.${batteryColumn}, '$.current') AS REAL) END AS net_current_a,
+           CASE WHEN json_extract(readings.${batteryColumn}, '$.connected') = 1
+             THEN readings.${socColumn} END AS soc,
+           json_extract(readings.${batteryColumn}, '$.connected') AS connected
+    FROM sampled
+    JOIN readings ON readings.id = sampled.reading_id
+    ORDER BY sampled.bucket ASC
+  `).bind(bucketCount, identity.id, range.startMs, bucketMs, range.startMs, bucketMs).all();
   const series = result.results.map((point) => ({
     timestamp_ms: Number(point.timestamp_ms),
     mode: point.mode,
-    [`battery${slot}CurrentA`]: number(point.current_a),
     [`battery${slot}NetCurrentA`]: number(point.net_current_a),
     [`battery${slot}Soc`]: number(point.soc),
-    [`battery${slot}ReportedSoc`]: number(point.reported_soc),
-    [`battery${slot}Soh`]: number(point.soh),
     [`battery${slot}Connected`]: point.connected === 1,
     intervalMs: bucketMs,
   }));
   const ratedCapacityAh = identity.capacity_mah / 1000;
-  recalculateSocForCapacity(series, slot, ratedCapacityAh);
+  const cycles = await loadCycles(db, identity.id);
+  const forecast = forecastFromCycles(cycles);
+  const cycleInfo = await latestIdentityCycle(db, identity.id);
+
+  const chartSeries = fillGaps(series.map((point) => ({
+    timestamp_ms: point.timestamp_ms,
+    mode: point.mode,
+    [`battery${slot}Soc`]: point[`battery${slot}Connected`] ? point[`battery${slot}Soc`] : null,
+    [`battery${slot}DischargeA`]: point[`battery${slot}Connected`] && point[`battery${slot}NetCurrentA`] < 0
+      ? -point[`battery${slot}NetCurrentA`] : null,
+  })), bucketMs, [`battery${slot}Soc`, `battery${slot}DischargeA`]);
 
   return {
     identityId: identity.id,
     slot,
     name: identity.name,
     ratedCapacityAh,
+    measuredCapacityAh: cycleInfo?.capacity_ah ?? null,
     sampleCount: series.length,
-    series: series.map((point) => ({
-      timestamp_ms: point.timestamp_ms,
-      mode: point.mode,
-      [`battery${slot}Soc`]: point[`battery${slot}Connected`] ? point[`battery${slot}Soc`] : null,
-      [`battery${slot}DischargeA`]: point[`battery${slot}Connected`]
-        ? point[`battery${slot}CurrentA`] : null,
+    series: chartSeries,
+    analytics: {
+      ...withCycleRates(batteryAnalytics(series, slot, ratedCapacityAh), cycles, range),
+      completedCycles: cycleInfo?.cycles ?? 0,
+      loggedCycles: cycles.length,
+      latestSoh: cycleInfo?.soh_reported ?? null,
+      lastCycleAtMs: cycleInfo?.ended_at_ms ?? null,
+    },
+    forecast,
+    cycles: cycles.slice(-30).map((cycle) => ({
+      number: cycle.cycle_number,
+      startedAtMs: cycle.started_at_ms,
+      endedAtMs: cycle.ended_at_ms,
+      hours: cycle.hours,
+      avgLoadA: cycle.avg_load_a,
+      dodPercent: cycle.dod_percent,
+      socFinal: cycle.soc_final,
+      source: cycle.soc_final_source,
+      capacityAh: cycle.capacity_ah,
+      sohRaw: cycle.soh_raw,
+      sohReported: cycle.soh_reported,
     })),
-    analytics: batteryAnalytics(series, slot),
   };
 }
 
@@ -668,14 +1097,21 @@ async function createReadingCapture(env) {
   }
 }
 
+const ANALYTICS_RANGES = {
+  '1h': 60 * 60 * 1000,
+  '24h': DAY_MS,
+  '7d': 7 * DAY_MS,
+  '30d': 30 * DAY_MS,
+};
+
 async function readAnalytics(request, env) {
   try {
     const db = env.battery_management_db;
-    const rangeDays = 1;
-    const rangeMs = rangeDays * 24 * 60 * 60 * 1000;
-    const bucketMs = Math.max(60000, Math.ceil(rangeMs / 10000 / 60000) * 60000);
-    const identities = await getBatteryIdentities(db);
     const searchParams = new URL(request.url).searchParams;
+    const range = resolveRange(searchParams, ANALYTICS_RANGES, '1h');
+    const bucketCount = Math.min(600, Math.max(1, Math.ceil(range.rangeMs / 60000)));
+    const bucketMs = Math.ceil(range.rangeMs / bucketCount);
+    const identities = await getBatteryIdentities(db);
     const chooseIdentity = (parameter, slot) => {
       const requestedId = Number(searchParams.get(parameter));
       return identities.find((identity) => identity.id === requestedId)
@@ -684,13 +1120,17 @@ async function readAnalytics(request, env) {
     };
     const leftIdentity = chooseIdentity('leftBatteryId', 1);
     const rightIdentity = chooseIdentity('rightBatteryId', 2);
-    const [left, right] = await Promise.all([
-      readBatteryIdentityAnalytics(db, leftIdentity, Date.now() - rangeMs, bucketMs),
-      readBatteryIdentityAnalytics(db, rightIdentity, Date.now() - rangeMs, bucketMs),
-    ]);
+    const leftPromise = readBatteryIdentityAnalytics(db, leftIdentity, range, bucketMs, bucketCount);
+    const rightPromise = rightIdentity?.id === leftIdentity?.id
+      ? leftPromise
+      : readBatteryIdentityAnalytics(db, rightIdentity, range, bucketMs, bucketCount);
+    const [left, right] = await Promise.all([leftPromise, rightPromise]);
 
     return json({
-      days: rangeDays,
+      range: range.key,
+      startMs: range.startMs,
+      endMs: range.endMs,
+      days: range.rangeMs / DAY_MS,
       bucketMs,
       batteryIdentities: identities,
       selectedIdentityIds: {
@@ -702,6 +1142,55 @@ async function readAnalytics(request, env) {
     });
   } catch (error) {
     return json({ error: error.message || 'Could not calculate battery analytics' }, 500);
+  }
+}
+
+// GET /api/forecast?batteryId=ID  (all stored cycles of that saved battery, independent of any date range)
+async function readForecast(request, env) {
+  try {
+    const db = env.battery_management_db;
+    const identities = await getBatteryIdentities(db);
+    const requested = Number(new URL(request.url).searchParams.get('batteryId'));
+    const identity = identities.find((item) => item.id === requested)
+      || identities.find((item) => item.active && item.slot === 1)
+      || identities[0] || null;
+    if (!identity) return json({ batteryIdentities: identities, identity: null, forecast: buildForecast([]), cycles: [] });
+    const cycles = await loadCycles(db, identity.id);
+    return json({
+      batteryIdentities: identities,
+      identity: { id: identity.id, slot: identity.slot, name: identity.name, ratedCapacityAh: identity.capacity_mah / 1000 },
+      forecast: forecastFromCycles(cycles),
+      cycles,
+    });
+  } catch (error) {
+    return json({ error: error.message || 'Could not calculate the SOH forecast' }, 500);
+  }
+}
+
+async function exportCyclesCsv(request, env) {
+  try {
+    const db = env.battery_management_db;
+    const identities = await getBatteryIdentities(db);
+    const identity = identities.find((item) => item.id === Number(new URL(request.url).searchParams.get('batteryId')));
+    if (!identity) return json({ error: 'Choose a saved battery' }, 400);
+    const cycles = await loadCycles(db, identity.id, 100000);
+    const timeZone = env.CSV_TIME_ZONE || 'Asia/Manila';
+    const head = 'Battery,Cycle,Started,Ended,Hours,Average load (A),Discharged (Ah),SOC start (%),SOC final (%),SOC final source,Depth of discharge (%),Capacity (Ah),SOH raw (%),SOH reported (%)';
+    const lines = cycles.map((cycle) => [
+      `"${identity.name.replace(/"/g, '""')}"`, cycle.cycle_number ?? '',
+      formatTimestamp(cycle.started_at_ms, timeZone), formatTimestamp(cycle.ended_at_ms, timeZone),
+      cycle.hours.toFixed(4), cycle.avg_load_a.toFixed(4), cycle.discharged_ah.toFixed(4),
+      cycle.soc_start.toFixed(3), cycle.soc_final.toFixed(3), cycle.soc_final_source, cycle.dod_percent.toFixed(3),
+      cycle.capacity_ah?.toFixed(4) ?? '', cycle.soh_raw?.toFixed(4) ?? '', cycle.soh_reported?.toFixed(4) ?? '',
+    ].join(','));
+    return new Response(`${head}\r\n${lines.join('\r\n')}\r\n`, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="cycles-${identity.name.replace(/[^\w.-]+/g, '_')}.csv"`,
+      },
+    });
+  } catch (error) {
+    return json({ error: error.message || 'Could not export cycles' }, 500);
   }
 }
 
@@ -786,6 +1275,10 @@ function authorizeDevice(request, env) {
   return null;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Telemetry from the ESP32
+// ---------------------------------------------------------------------------------------------
+
 async function receiveTelemetry(request, env) {
   const unauthorized = authorizeDevice(request, env);
   if (unauthorized) return unauthorized;
@@ -796,11 +1289,14 @@ async function receiveTelemetry(request, env) {
       return json({ error: 'Telemetry must be a JSON object' }, 400);
     }
 
+    const db = env.battery_management_db;
     const timestampMs = Date.now();
-    const [previous, batterySpecs, pendingCapture] = await Promise.all([
-      getLatestReading(env.battery_management_db),
-      getBatterySpecs(env.battery_management_db),
-      env.battery_management_db.prepare(`
+    const [previous, batterySpecs, identities, session, pendingCapture] = await Promise.all([
+      getLatestReading(db),
+      getBatterySpecs(db),
+      getBatteryIdentities(db),
+      getSessionRow(db),
+      db.prepare(`
         SELECT id
         FROM reading_capture_requests
         WHERE status = 'pending'
@@ -812,22 +1308,49 @@ async function receiveTelemetry(request, env) {
     const battery2 = normalizeBattery(data.battery2);
     const system = data.system && typeof data.system === 'object' ? data.system : {};
     const wifi = data.wifi && typeof data.wifi === 'object' ? data.wifi : {};
-    const captureRequestId = String(data.mode || '').trim().toUpperCase() !== 'SYSTEM OFF'
+    const mode = data.mode ?? null;
+    const captureRequestId = String(mode || '').trim().toUpperCase() !== 'SYSTEM OFF'
       ? pendingCapture?.id ?? null
       : null;
-    const previousInIdentity = previous?.battery1_identity_id === (batterySpecs[1]?.identity_id ?? null)
-      && previous?.battery2_identity_id === (batterySpecs[2]?.identity_id ?? null)
-      ? previous
-      : null;
-    const elapsedSeconds = previousInIdentity
-      ? Math.max(0, (timestampMs - previousInIdentity.timestamp_ms) / 1000)
-      : 0;
-    const battery1Soc = estimateSoc(battery1, previousInIdentity?.battery1_soc ?? null, elapsedSeconds, env, 1, batterySpecs);
-    const battery2Soc = estimateSoc(battery2, previousInIdentity?.battery2_soc ?? null, elapsedSeconds, env, 2, batterySpecs);
-    const battery1Soh = estimateSoh(battery1, env, 1, batterySpecs);
-    const battery2Soh = estimateSoh(battery2, env, 2, batterySpecs);
+    const params = healthParams(env);
 
-    const result = await env.battery_management_db.prepare(`
+    const { state, soh: sohBySlot, known } = await loadEngineState(db, env, batterySpecs, identities, Boolean(previous));
+    const input = {
+      tsMs: timestampMs,
+      mode: mode ?? '',
+      slots: { 1: engineReading(battery1), 2: engineReading(battery2) },
+    };
+
+    // Did the connection stop and come back (long gap, or a sensor that was missing is back)?
+    const reconnectGapMs = (number(env.RECONNECT_GAP_SECONDS) ?? DEFAULT_RECONNECT_GAP_SECONDS) * 1000;
+    const resumedAfterGap = Boolean(previous) && timestampMs - previous.timestamp_ms > reconnectGapMs;
+    const sensorBack = [1, 2].some((slot) => known[slot] && !state.slots[slot].connected && input.slots[slot].connected);
+    const startsQuestion = Boolean(previous) && !session.pending && (resumedAfterGap || sensorBack);
+    const frozen = Boolean(session.pending) || startsQuestion;
+
+    const outcome = processTelemetry(state, input, params, { freeze: frozen });
+
+    // Score the discharge cycles that finished on this reading.
+    const cycleRows = [];
+    for (const cycle of outcome.finishedCycles) {
+      const identityId = batterySpecs[cycle.slot]?.identity_id ?? null;
+      if (!identityId) continue;
+      const context = await scoringContext(db, identityId);
+      const score = scoreCycle(cycle, context, params);
+      cycleRows.push({ cycle, identityId, score, number: score.usable ? context.usableCount + 1 : null });
+      if (score.usable) sohBySlot[cycle.slot] = score.sohReported;
+    }
+
+    const soc = {};
+    const soh = {};
+    for (const slot of [1, 2]) {
+      const update = outcome.slots[slot];
+      const battery = slot === 1 ? battery1 : battery2;
+      soc[slot] = update.soc;
+      soh[slot] = update.connected ? (reportedSohFrom(battery) ?? sohBySlot[slot] ?? null) : null;
+    }
+
+    const result = await db.prepare(`
       INSERT INTO readings (
         timestamp_ms, mode, switching, wifi_json, system_json,
         battery1_json, battery2_json,
@@ -836,30 +1359,77 @@ async function receiveTelemetry(request, env) {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       timestampMs,
-      data.mode ?? null,
+      mode,
       data.switching ? 1 : 0,
       JSON.stringify(wifi),
       JSON.stringify(system),
       JSON.stringify(battery1),
       JSON.stringify(battery2),
-      battery1Soc,
-      battery2Soc,
-      battery1Soh,
-      battery2Soh,
+      soc[1],
+      soc[2],
+      soh[1],
+      soh[2],
       captureRequestId,
       batterySpecs[1]?.identity_id ?? null,
       batterySpecs[2]?.identity_id ?? null,
     ).run();
+    const readingId = result.meta.last_row_id;
 
+    const statements = [];
     if (captureRequestId !== null) {
-      await env.battery_management_db.prepare(`
+      statements.push(db.prepare(`
         UPDATE reading_capture_requests
         SET status = 'captured', captured_at_ms = ?, reading_id = ?
         WHERE id = ? AND status = 'pending'
-      `).bind(timestampMs, result.meta.last_row_id, captureRequestId).run();
+      `).bind(timestampMs, readingId, captureRequestId));
     }
+    if (startsQuestion) {
+      statements.push(db.prepare(`
+        UPDATE connection_sessions
+        SET pending = 1, since_reading_id = ?, gap_started_ms = ?, resumed_ms = ?,
+            previous_identity1 = ?, previous_identity2 = ?, reason = ?
+        WHERE id = 1
+      `).bind(
+        readingId, previous.timestamp_ms, timestampMs,
+        batterySpecs[1]?.identity_id ?? null, batterySpecs[2]?.identity_id ?? null,
+        resumedAfterGap ? 'gap' : 'sensor',
+      ));
+    }
+    for (const { cycle, identityId, score, number: cycleNumber } of cycleRows) {
+      statements.push(db.prepare(`
+        INSERT OR IGNORE INTO battery_cycles (
+          identity_id, slot, cycle_number, started_at_ms, ended_at_ms, hours, avg_load_a, discharged_ah,
+          soc_start, soc_final, soc_final_source, dod_percent, capacity_ah, soh_raw, soh_reported, created_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        identityId, cycle.slot, cycleNumber, cycle.startedMs, cycle.endedMs, cycle.hours, cycle.avgLoadA,
+        cycle.dischargedAh, cycle.socStart, cycle.socFinal, cycle.socFinalSource, cycle.dodPercent,
+        cycle.capacityAh, score.usable ? score.sohRaw : null, score.usable ? score.sohReported : null, timestampMs,
+      ));
+    }
+    for (const slot of [1, 2]) {
+      const update = outcome.slots[slot];
+      const identityId = batterySpecs[slot]?.identity_id ?? null;
+      statements.push(slotStateStatement(db, slot, {
+        identityId,
+        soc: update.soc ?? state.slots[slot].soc,
+        tsMs: timestampMs,
+        connected: update.connected,
+        tracker: update.tracker,
+        soh: sohBySlot[slot] ?? null,
+      }));
+      if (identityId && update.fullVoltageChanged && Number.isFinite(update.fullVoltage)) {
+        statements.push(db.prepare('UPDATE battery_identities SET full_voltage_v = ? WHERE id = ?')
+          .bind(update.fullVoltage, identityId));
+      }
+    }
+    await db.batch(statements);
 
-    return json({ success: true, receivedAt: timestampMs });
+    return json({
+      success: true,
+      receivedAt: timestampMs,
+      batteryConfirmationRequired: Boolean(session.pending) || startsQuestion,
+    });
   } catch (error) {
     return json({ error: error.message || 'Could not store telemetry' }, 400);
   }
@@ -911,22 +1481,27 @@ async function readEsp32(env) {
 
 async function getHealth(env) {
   try {
+    const db = env.battery_management_db;
     const [row, batterySpecs] = await Promise.all([
-      getLatestReading(env.battery_management_db),
-      getBatterySpecs(env.battery_management_db),
+      getLatestReading(db),
+      getBatterySpecs(db),
     ]);
     if (!row) {
       return json({
         configured: true,
-        battery1: { soc: null, soh: null, error: 'No D1 reading found', source: 'd1' },
-        battery2: { soc: null, soh: null, error: 'No D1 reading found', source: 'd1' },
+        battery1: { soc: null, soh: null, ratedCapacityAh: capacityForBattery(env, 1, batterySpecs), error: 'No D1 reading found', source: 'd1' },
+        battery2: { soc: null, soh: null, ratedCapacityAh: capacityForBattery(env, 2, batterySpecs), error: 'No D1 reading found', source: 'd1' },
       });
     }
+    const [cycle1, cycle2] = await Promise.all([
+      batterySpecs[1]?.identity_id ? latestIdentityCycle(db, batterySpecs[1].identity_id) : null,
+      batterySpecs[2]?.identity_id ? latestIdentityCycle(db, batterySpecs[2].identity_id) : null,
+    ]);
 
     return json({
       configured: true,
-      battery1: healthForBattery(JSON.parse(row.battery1_json), row.battery1_soc, row.battery1_soh, env, 1, batterySpecs),
-      battery2: healthForBattery(JSON.parse(row.battery2_json), row.battery2_soc, row.battery2_soh, env, 2, batterySpecs),
+      battery1: healthForBattery(JSON.parse(row.battery1_json), row.battery1_soc, row.battery1_soh, env, 1, batterySpecs, cycle1),
+      battery2: healthForBattery(JSON.parse(row.battery2_json), row.battery2_soc, row.battery2_soh, env, 2, batterySpecs, cycle2),
     });
   } catch (error) {
     return json({ configured: true, error: error.message }, 500);
@@ -1016,11 +1591,17 @@ export default {
 
     if (pathname === '/api/esp32' && request.method === 'GET') return readEsp32(env);
     if (pathname === '/api/readings' && request.method === 'GET') return readHistory(request, env);
+    if (pathname === '/api/readings.csv' && request.method === 'GET') return exportReadingsCsv(request, env);
+    if (pathname === '/api/cycles.csv' && request.method === 'GET') return exportCyclesCsv(request, env);
     if (pathname === '/api/reading-captures' && request.method === 'POST') return createReadingCapture(env);
     if (pathname === '/api/analytics' && request.method === 'GET') return readAnalytics(request, env);
+    if (pathname === '/api/forecast' && request.method === 'GET') return readForecast(request, env);
     if (pathname === '/api/health' && request.method === 'GET') return getHealth(env);
+    if (pathname === '/api/session' && request.method === 'GET') return readSession(env);
+    if (pathname === '/api/session/resolve' && request.method === 'POST') return resolveSession(request, env);
     if (pathname === '/api/batteries' && request.method === 'GET') return readBatteries(env);
     if (pathname === '/api/batteries' && request.method === 'POST') return saveBattery(request, env);
+    if (pathname === '/api/batteries/activate' && request.method === 'POST') return activateBattery(request, env);
     const batteryMatch = pathname.match(/^\/api\/batteries\/(\d+)$/);
     if (batteryMatch && request.method === 'DELETE') return deleteBattery(request, env, Number(batteryMatch[1]));
     if (pathname.startsWith('/api/control/')) return queueControl(request, env, pathname);

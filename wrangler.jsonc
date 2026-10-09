@@ -8,10 +8,12 @@
     "port": 8787
   },
   "vars": {
-    "BATTERY1_CAPACITY_AH": "10",
-    "BATTERY2_CAPACITY_AH": "2.2",
-    "BATTERY_CAPACITY_AH": "10",
-    "INITIAL_SOC": "100"
+    "BATTERY1_CAPACITY_AH": "40",
+    "BATTERY2_CAPACITY_AH": "40",
+    "BATTERY_CAPACITY_AH": "40",
+    "INITIAL_SOC": "100",
+    "RECONNECT_GAP_SECONDS": "120",
+    "CSV_TIME_ZONE": "Asia/Manila"
   },
   "assets": {
     "directory": "./dist",

@@ -6,6 +6,7 @@ import {
   Clock3,
   ClipboardCheck,
   Database,
+  Download,
   Power,
   RefreshCw,
   TriangleAlert,
@@ -14,11 +15,13 @@ import {
   X,
   Zap,
 } from 'lucide-react'
+import { formatValue, statusClass } from './chartUtils.js'
 import './App.css'
 
 const HistoryBatteryPanel = lazy(() => import('./HistoryBatteryPanel.jsx'))
 const AnalyticsPanel = lazy(() => import('./AnalyticsPanel.jsx'))
 const BatteryInventory = lazy(() => import('./BatteryInventory.jsx'))
+const ConnectionPrompt = lazy(() => import('./ConnectionPrompt.jsx'))
 
 const HISTORY_RANGES = [
   { label: '1 hour', value: '1h' },
@@ -32,7 +35,8 @@ const HISTORY_METRICS = [
   { key: 'Current', label: 'Current', unit: 'A', decimals: 2 },
   { key: 'Voltage', label: 'Voltage', unit: 'V', decimals: 2 },
   { key: 'Temperature', label: 'Temperature', unit: '°C', decimals: 1 },
-  { key: 'Soc', label: 'Charge', unit: '%', decimals: 1 },
+  { key: 'Soc', label: 'Charge (SOC)', unit: '%', decimals: 1 },
+  { key: 'Soh', label: 'Health (SOH)', unit: '%', decimals: 2 },
 ]
 
 function getHardwareAlerts(reading) {
@@ -61,12 +65,6 @@ function getHardwareAlerts(reading) {
     })
   }
   return alerts
-}
-
-function formatValue(value, decimals = 2) {
-  if (value === null || value === undefined || value === '') return '--'
-  const numericValue = Number(value)
-  return Number.isFinite(numericValue) ? numericValue.toFixed(decimals) : '--'
 }
 
 function batteryStatus(battery, system, index) {
@@ -106,7 +104,7 @@ function BatteryPanel({ index, battery, health, system, batteryName }) {
             <h2 id={`battery-${index}-title`}>{batteryName || `Battery ${index}`}</h2>
           </div>
         </div>
-        <span className={`status-pill status-${status.toLowerCase()}`}>{status}</span>
+        <span className={`status-pill status-${statusClass(status)}`}>{status}</span>
       </div>
 
       <div className="metric-grid">
@@ -120,12 +118,19 @@ function BatteryPanel({ index, battery, health, system, batteryName }) {
         <Metric label="State of charge" value={hasSignal ? health?.soc : null} unit="%" decimals={1} emphasis />
         <Metric label="State of health" value={hasSignal ? health?.soh : null} unit="%" decimals={1} emphasis />
       </div>
+      <p className="battery-capacity-line">
+        Rated {formatValue(health?.ratedCapacityAh, 1)} Ah
+        {Number.isFinite(health?.capacityAh) ? ` · measured ${formatValue(health.capacityAh, 1)} Ah` : ''}
+        {Number.isFinite(health?.cycleCount) ? ` · ${health.cycleCount} scored cycle${health.cycleCount === 1 ? '' : 's'}` : ''}
+      </p>
     </section>
   )
 }
 
 function DatabaseReader() {
   const [range, setRange] = useState('24h')
+  const [customFrom, setCustomFrom] = useState('')
+  const [customTo, setCustomTo] = useState('')
   const [metricKey, setMetricKey] = useState('Power')
   const [leftBatteryId, setLeftBatteryId] = useState('')
   const [rightBatteryId, setRightBatteryId] = useState('')
@@ -138,6 +143,10 @@ function DatabaseReader() {
   const identities = history?.batteryIdentities ?? []
   const tableIdentity = identities.find((identity) => String(identity.id) === tableBatteryId)
   const tableSlot = String(tableIdentity?.slot ?? 1)
+  const customFromMs = customFrom ? new Date(customFrom).getTime() : null
+  const customToMs = customTo ? new Date(customTo).getTime() : null
+  const customActive = range === 'custom' && Number.isFinite(customFromMs) && Number.isFinite(customToMs) && customToMs > customFromMs
+  const rangeParams = customActive ? { from: String(customFromMs), to: String(customToMs) } : { range: range === 'custom' ? '24h' : range }
 
   useEffect(() => {
     let stopped = false
@@ -147,7 +156,7 @@ function DatabaseReader() {
     async function loadHistory() {
       try {
         const params = new URLSearchParams({
-          range,
+          ...rangeParams,
           slot: tableSlot,
           sort: tableSort,
           order: tableOrder,
@@ -172,16 +181,23 @@ function DatabaseReader() {
       }
     }
 
-    loadHistory()
-    const interval = window.setInterval(loadHistory, 30000)
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') loadHistory()
+    }
+    refreshWhenVisible()
+    const interval = window.setInterval(refreshWhenVisible, 300000)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
     return () => {
       stopped = true
       window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
     }
-  }, [range, refreshToken, tableBatteryId, tableSlot, tableSortMode, metricKey, leftBatteryId, rightBatteryId])
+  // rangeParams is rebuilt each render from range / customFrom / customTo, which are listed instead.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range, customFrom, customTo, refreshToken, tableBatteryId, tableSlot, tableSortMode, metricKey, leftBatteryId, rightBatteryId])
 
   const metric = HISTORY_METRICS.find((item) => item.key === metricKey) ?? HISTORY_METRICS[0]
-  const sampleCount = history?.series?.reduce((total, point) => total + point.samples, 0) ?? 0
+  const sampleCount = history?.sampleCount ?? 0
   const latest = history?.readings?.[0]
   const leftIdentity = identities.find((identity) => String(identity.id) === leftBatteryId)
   const rightIdentity = identities.find((identity) => String(identity.id) === rightBatteryId)
@@ -189,6 +205,7 @@ function DatabaseReader() {
     { side: 'left', identity: leftIdentity, history: history?.identitySeries?.left },
     { side: 'right', identity: rightIdentity, history: history?.identitySeries?.right },
   ]
+  const csvParams = new URLSearchParams(rangeParams).toString()
   const tableSortLabel = tableSortMode === 'latest'
     ? 'Latest readings'
     : `${tableSortMode === 'highest' ? 'Highest' : 'Lowest'} ${metric.label.toLowerCase()}`
@@ -207,7 +224,7 @@ function DatabaseReader() {
 
       <div className="history-toolbar">
         <div className="segmented-control" aria-label="History time range">
-          {HISTORY_RANGES.map((item) => (
+          {[...HISTORY_RANGES, { label: 'Custom', value: 'custom' }].map((item) => (
             <button
               className={range === item.value ? 'segment-active' : ''}
               type="button"
@@ -247,6 +264,21 @@ function DatabaseReader() {
             {identities.map((identity) => <option value={identity.id} key={identity.id}>{identity.name}{identity.active ? ` · Slot ${identity.slot}` : ` · Previous #${identity.id}`}</option>)}
           </select>
         </label>
+        {range === 'custom' && (
+          <>
+            <label className="history-select-field">
+              <span>From</span>
+              <input className="battery-history-filter" type="datetime-local" value={customFrom} max={customTo || undefined} onChange={(event) => setCustomFrom(event.target.value)} />
+            </label>
+            <label className="history-select-field">
+              <span>To</span>
+              <input className="battery-history-filter" type="datetime-local" value={customTo} min={customFrom || undefined} onChange={(event) => setCustomTo(event.target.value)} />
+            </label>
+          </>
+        )}
+        <a className="icon-button history-refresh" href={`/api/readings.csv?${csvParams}`} download title="Download these readings as CSV (Dataset 2 layout)" aria-label="Download readings as CSV">
+          <Download size={17} />
+        </a>
         <button
           className="icon-button history-refresh"
           type="button"
@@ -267,6 +299,9 @@ function DatabaseReader() {
       </div>
 
       {error && <div className="notice notice-error" role="alert">{error}</div>}
+      {range === 'custom' && !customActive && (
+        <div className="notice notice-info" role="status">Pick a start and end time (up to 366 days) to look up past data, for example the Dataset 2 period.</div>
+      )}
 
       <Suspense fallback={<div className="history-graphs-loading">Loading graphs...</div>}>
         <div className="history-battery-grid">
@@ -277,7 +312,8 @@ function DatabaseReader() {
               latest={identityHistory?.latest}
               series={identityHistory?.series ?? []}
               metric={metric}
-              range={range}
+              startMs={history?.startMs}
+              endMs={history?.endMs}
               batteryName={identity?.name ?? 'Select a battery'}
             />
           ))}
@@ -319,6 +355,8 @@ function DatabaseReader() {
                 <th scope="col">Current</th>
                 <th scope="col">Power</th>
                 <th scope="col">Temperature</th>
+                <th scope="col">SOC</th>
+                <th scope="col">SOH</th>
               </tr>
             </thead>
             <tbody>
@@ -332,9 +370,11 @@ function DatabaseReader() {
                   <td>{formatValue(item[`battery${tableSlot}`].current)}</td>
                   <td>{formatValue(item[`battery${tableSlot}`].power)}</td>
                   <td>{formatValue(item[`battery${tableSlot}`].temperature, 1)}</td>
+                  <td>{formatValue(item[`battery${tableSlot}`].soc, 1)}</td>
+                  <td>{formatValue(item[`battery${tableSlot}`].soh, 2)}</td>
                 </tr>
               )) : (
-                <tr><td className="reading-table-empty" colSpan={8}>No stored readings in this time range</td></tr>
+                <tr><td className="reading-table-empty" colSpan={10}>No stored readings in this time range</td></tr>
               )}
             </tbody>
           </table>
@@ -356,20 +396,24 @@ function App() {
   const [refreshToken, setRefreshToken] = useState(0)
   const [dismissedAlerts, setDismissedAlerts] = useState(() => new Set())
   const [activeTab, setActiveTab] = useState('overview')
+  const [session, setSession] = useState(null)
 
   useEffect(() => {
     let stopped = false
 
     async function refreshDashboard() {
       try {
-        const [readingResponse, healthResponse] = await Promise.all([
+        const [readingResponse, healthResponse, sessionResponse] = await Promise.all([
           fetch('/api/esp32'),
           fetch('/api/health'),
+          fetch('/api/session').catch(() => null),
         ])
         const [readingResult, healthResult] = await Promise.all([
           readingResponse.json(),
           healthResponse.json(),
         ])
+        const sessionResult = sessionResponse?.ok ? await sessionResponse.json().catch(() => null) : null
+        if (!stopped) setSession(sessionResult?.pending ? sessionResult : null)
 
         if (stopped) return
         setBatterySpecs(readingResult.batteries ?? [])
@@ -581,6 +625,19 @@ function App() {
           </div>
         )}
 
+        {session?.pending && (
+          <Suspense fallback={null}>
+            <ConnectionPrompt
+              key={session.sinceReadingId}
+              session={session}
+              onResolved={() => {
+                setSession(null)
+                setRefreshToken((token) => token + 1)
+              }}
+            />
+          </Suspense>
+        )}
+
         {visibleAlerts.length > 0 && (
           <aside className="notification-stack" aria-label="Hardware notifications">
             {visibleAlerts.map((alert) => (
@@ -606,7 +663,10 @@ function App() {
 
         <footer className="dashboard-footer">
           <span>ESP32 dual battery monitor</span>
-          <span>Rated capacity <strong>{health?.battery1?.ratedCapacityAh ?? 100} Ah</strong></span>
+          <span>
+            Rated capacity: Battery 1 <strong>{formatValue(health?.battery1?.ratedCapacityAh, 1)} Ah</strong>
+            {' · '}Battery 2 <strong>{formatValue(health?.battery2?.ratedCapacityAh, 1)} Ah</strong>
+          </span>
         </footer>
       </main>
     </div>

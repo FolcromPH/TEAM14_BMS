@@ -3,10 +3,20 @@ import { Activity, RefreshCw } from 'lucide-react'
 import './App.css'
 
 const AnalyticsBatteryPanel = lazy(() => import('./AnalyticsBatteryPanel.jsx'))
+const ANALYTICS_RANGES = [
+  { value: '1h', label: 'Last hour' },
+  { value: '24h', label: 'Last 24 hours' },
+  { value: '7d', label: 'Last 7 days' },
+  { value: '30d', label: 'Last 30 days' },
+  { value: 'custom', label: 'Custom dates' },
+]
 
 export default function AnalyticsPanel() {
   const [leftBatteryId, setLeftBatteryId] = useState('')
   const [rightBatteryId, setRightBatteryId] = useState('')
+  const [range, setRange] = useState('1h')
+  const [customFrom, setCustomFrom] = useState('')
+  const [customTo, setCustomTo] = useState('')
   const [analytics, setAnalytics] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -14,11 +24,23 @@ export default function AnalyticsPanel() {
 
   useEffect(() => {
     let stopped = false
+    const controller = new AbortController()
 
     async function load() {
       try {
-        const params = new URLSearchParams({ leftBatteryId, rightBatteryId })
-        const response = await fetch(`/api/analytics?${params}`)
+        const fromMs = customFrom ? new Date(customFrom).getTime() : NaN
+        const toMs = customTo ? new Date(customTo).getTime() : NaN
+        const custom = range === 'custom' && Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs > fromMs
+        if (range === 'custom' && !custom) {
+          setLoading(false)
+          return
+        }
+        const params = new URLSearchParams({
+          leftBatteryId,
+          rightBatteryId,
+          ...(custom ? { from: String(fromMs), to: String(toMs) } : { range }),
+        })
+        const response = await fetch(`/api/analytics?${params}`, { signal: controller.signal })
         const result = await response.json()
         if (!response.ok) throw new Error(result.error || 'Could not load battery analytics')
         if (stopped) return
@@ -27,20 +49,26 @@ export default function AnalyticsPanel() {
         setRightBatteryId((current) => current || String(result.selectedIdentityIds.right || ''))
         setError('')
       } catch (requestError) {
-        if (stopped) return
+        if (stopped || requestError.name === 'AbortError') return
         setError(requestError.message || 'Could not load battery analytics')
       } finally {
         if (!stopped) setLoading(false)
       }
     }
 
-    load()
-    const interval = window.setInterval(load, 60000)
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') load()
+    }
+    refreshWhenVisible()
+    const interval = window.setInterval(refreshWhenVisible, 300000)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
     return () => {
       stopped = true
+      controller.abort()
       window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
     }
-  }, [refreshKey, leftBatteryId, rightBatteryId])
+  }, [refreshKey, leftBatteryId, rightBatteryId, range, customFrom, customTo])
 
   function refresh() {
     setLoading(true)
@@ -64,11 +92,29 @@ export default function AnalyticsPanel() {
         </div>
         <span className="analytics-sample-count">
           <Activity size={15} />
-          {loading ? 'Updating analysis' : `${analytics?.sampleCount?.toLocaleString() ?? 0} time buckets`}
+          {loading ? 'Updating analysis' : `${analytics?.sampleCount?.toLocaleString() ?? 0} samples`}
         </span>
       </div>
 
       <div className="analytics-toolbar">
+        <label className="history-select-field">
+          <span>Analysis period</span>
+          <select className="battery-history-filter" value={range} onChange={(event) => setRange(event.target.value)}>
+            {ANALYTICS_RANGES.map((item) => <option value={item.value} key={item.value}>{item.label}</option>)}
+          </select>
+        </label>
+        {range === 'custom' && (
+          <>
+            <label className="history-select-field">
+              <span>From</span>
+              <input className="battery-history-filter" type="datetime-local" value={customFrom} max={customTo || undefined} onChange={(event) => setCustomFrom(event.target.value)} />
+            </label>
+            <label className="history-select-field">
+              <span>To</span>
+              <input className="battery-history-filter" type="datetime-local" value={customTo} min={customFrom || undefined} onChange={(event) => setCustomTo(event.target.value)} />
+            </label>
+          </>
+        )}
         <label className="history-select-field">
           <span>Left graph</span>
           <select className="battery-history-filter" value={leftBatteryId} onChange={(event) => setLeftBatteryId(event.target.value)}>
@@ -97,16 +143,23 @@ export default function AnalyticsPanel() {
                 <AnalyticsBatteryPanel
                   index={graphIndex + 1}
                   batterySlot={data.slot}
+                  identityId={data.identityId}
                   batteryName={data.name}
                   analytics={data.analytics}
                   series={data.series}
+                  forecast={data.forecast}
+                  cycles={data.cycles}
                   ratedCapacityAh={data.ratedCapacityAh}
+                  measuredCapacityAh={data.measuredCapacityAh}
+                  startMs={analytics.startMs}
+                  endMs={analytics.endMs}
+                  rangeLabel={ANALYTICS_RANGES.find((item) => item.value === range)?.label.toLowerCase() ?? 'last hour'}
                 />
               </Suspense>
             ))}
           </div>
           <p className="analytics-method-note">
-            Drain is the net SOC decrease across valid readings in the last 24 hours. When the firmware does not send BMS-reported SOC, the Worker estimates SOC by integrating INA current against rated capacity, so the 1% timing is an estimate. A battery BMS with SOC output gives a more reliable trend.
+            Discharge is detected from the sign of each battery&apos;s measured current, never from the mode, because Battery 1 also powers the ESP32 in every mode. When completed cycles exist in the period, the drain rate comes from them (their exact hours, Ah and depth of discharge); otherwise from the SOC decline between samples. SOC uses voltage, current and time only (no temperature). SOH changes once per completed cycle, and a cycle only counts when it ends with a rest-voltage reading.
           </p>
         </>
       )}

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { BatteryCharging, CheckCircle2, ClipboardPlus, Plus, Save, Trash2, X } from 'lucide-react'
+import { BatteryCharging, CheckCircle2, ClipboardPlus, Download, Plus, Repeat2, Save, Trash2, X } from 'lucide-react'
 import './App.css'
 
 const SLOTS = [1, 2]
@@ -9,13 +9,28 @@ function blankBattery(slot) {
     slot,
     name: `Battery ${slot}`,
     voltageV: '12',
-    capacityValue: slot === 1 ? '10' : '2.2',
+    capacityValue: '40',
     capacityUnit: 'Ah',
   }
 }
 
+function toForm(battery) {
+  return {
+    slot: battery.slot,
+    name: battery.name,
+    voltageV: String(battery.voltage_v),
+    capacityValue: String(battery.capacity_mah / 1000),
+    capacityUnit: 'Ah',
+  }
+}
+
+function formatWhen(ms) {
+  return Number.isFinite(ms) ? new Date(ms).toLocaleString() : 'no data yet'
+}
+
 export default function BatteryInventory() {
   const [batteries, setBatteries] = useState({})
+  const [saved, setSaved] = useState([])
   const [loading, setLoading] = useState(true)
   const [savingSlot, setSavingSlot] = useState(null)
   const [creatingReading, setCreatingReading] = useState(false)
@@ -28,13 +43,8 @@ export default function BatteryInventory() {
     const response = await fetch('/api/batteries')
     const result = await response.json()
     if (!response.ok) throw new Error(result.error || 'Could not load battery records')
-    setBatteries(Object.fromEntries(result.batteries.map((battery) => [battery.slot, {
-      slot: battery.slot,
-      name: battery.name,
-      voltageV: String(battery.voltage_v),
-      capacityValue: String(battery.capacity_mah / 1000),
-      capacityUnit: 'Ah',
-    }])))
+    setBatteries(Object.fromEntries(result.batteries.map((battery) => [battery.slot, toForm(battery)])))
+    setSaved(result.saved ?? [])
   }
 
   useEffect(() => {
@@ -46,13 +56,8 @@ export default function BatteryInventory() {
         const result = await response.json()
         if (!response.ok) throw new Error(result.error || 'Could not load battery records')
         if (!stopped) {
-          setBatteries(Object.fromEntries(result.batteries.map((battery) => [battery.slot, {
-            slot: battery.slot,
-            name: battery.name,
-            voltageV: String(battery.voltage_v),
-            capacityValue: String(battery.capacity_mah / 1000),
-            capacityUnit: 'Ah',
-          }])))
+          setBatteries(Object.fromEntries(result.batteries.map((battery) => [battery.slot, toForm(battery)])))
+          setSaved(result.saved ?? [])
         }
       } catch (error) {
         if (!stopped) setMessage(error.message || 'Could not load battery records')
@@ -106,10 +111,34 @@ export default function BatteryInventory() {
       if (!response.ok || !result.success) throw new Error(result.error || 'Could not save battery')
       await loadBatteries()
       setMessage(result.createdIdentity
-        ? `${result.battery.name} saved as a new battery identity. Older readings remain in history.`
-        : `${result.battery.name} saved`)
+        ? `${result.battery.name} saved as a new battery. Its history starts empty; earlier readings stay with the previous battery.`
+        : result.switchedToSaved
+          ? `${result.battery.name} was already saved for slot ${slot}, so its recorded history and last SOC / SOH are back in use.`
+          : result.capacityChanged
+            ? `${result.battery.name} now uses ${Number(battery.capacityValue) * (battery.capacityUnit === 'Ah' ? 1 : 0.001)} Ah from the next reading on. SOC already recorded was not recalculated, and cycles recorded earlier keep the capacity they were measured against.`
+            : `${result.battery.name} saved`)
     } catch (error) {
       setMessage(error.message || 'Could not save battery')
+    } finally {
+      setSavingSlot(null)
+    }
+  }
+
+  async function activateSaved(slot, identityId) {
+    setSavingSlot(slot)
+    setMessage('')
+    try {
+      const response = await fetch('/api/batteries/activate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slot, identityId }),
+      })
+      const result = await response.json()
+      if (!response.ok || !result.success) throw new Error(result.error || 'Could not switch battery')
+      await loadBatteries()
+      setMessage(`${result.battery.name} is now the battery in slot ${slot}. Its recorded data and last SOC / SOH are used from the next reading.`)
+    } catch (error) {
+      setMessage(error.message || 'Could not switch battery')
     } finally {
       setSavingSlot(null)
     }
@@ -253,6 +282,10 @@ export default function BatteryInventory() {
                 </label>
               </div>
 
+              <p className="inventory-hint">
+                Changing the Ah applies to SOC, SOH, cycles-to-80% and every screen from the next reading on.
+              </p>
+
               <div className="inventory-actions">
                 <button className="control-button control-charge" type="submit" disabled={loading || savingSlot !== null}>
                   {exists ? <Save size={16} /> : <Plus size={16} />}
@@ -274,12 +307,41 @@ export default function BatteryInventory() {
                   </button>
                 )}
               </div>
+
+              <div className="saved-batteries">
+                <h4>Saved batteries for slot {slot}</h4>
+                {saved.filter((item) => item.slot === slot).length === 0 && <p className="inventory-hint">None yet.</p>}
+                <ul>
+                  {saved.filter((item) => item.slot === slot).map((item) => (
+                    <li key={item.id} className={item.active ? 'saved-active' : ''}>
+                      <div>
+                        <strong>{item.name}</strong>{item.active && <span className="status-pill status-online">IN USE</span>}
+                        <small>
+                          {item.capacityAh} Ah · {item.cycles} scored cycle{item.cycles === 1 ? '' : 's'}
+                          {' · '}SOH {Number.isFinite(item.soh) ? `${item.soh.toFixed(1)}%` : '--'}
+                          {' · '}last recorded {formatWhen(item.lastRecordedMs)}
+                        </small>
+                      </div>
+                      <div className="saved-actions">
+                        {!item.active && (
+                          <button type="button" className="inventory-cancel" disabled={savingSlot !== null} onClick={() => activateSaved(slot, item.id)}>
+                            <Repeat2 size={14} />Use
+                          </button>
+                        )}
+                        <a className="inventory-cancel" href={`/api/cycles.csv?batteryId=${item.id}`} download title="Download this battery's cycle history (CSV)">
+                          <Download size={14} />Cycles
+                        </a>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             </form>
           )
         })}
       </div>
       {message && <p className="inventory-message" role="status">{message}</p>}
-      <p className="analytics-method-note">Changing a battery name and saving starts a new identity for that sensor slot. Earlier readings stay linked to the previous battery. Capacity can be entered in Ah or mAh.</p>
+      <p className="analytics-method-note">Each battery is saved by name for its sensor slot, with its own readings, cycles and SOH. Saving a new name starts a new battery; saving a name that is already saved brings that battery's history back. Changing only the Ah updates the same battery in place. Capacity can be entered in Ah or mAh.</p>
 
       {notification && (
         <div className="inventory-notification" role="status">

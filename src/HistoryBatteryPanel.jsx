@@ -7,12 +7,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-
-function formatValue(value, decimals = 2) {
-  if (value === null || value === undefined || value === '') return '--'
-  const numericValue = Number(value)
-  return Number.isFinite(numericValue) ? numericValue.toFixed(decimals) : '--'
-}
+import { formatValue, timeAxisProps } from './chartUtils.js'
 
 function Metric({ label, value, unit, decimals = 2 }) {
   return (
@@ -26,10 +21,11 @@ function Metric({ label, value, unit, decimals = 2 }) {
   )
 }
 
-export default function HistoryBatteryPanel({ index, latest, series, metric, range, batteryName }) {
+export default function HistoryBatteryPanel({ index, latest, series, metric, startMs, endMs, batteryName }) {
   const battery = latest
   const dataKey = metric.key.toLowerCase()
   const color = index === 1 ? '#23785f' : '#b06c29'
+  const isPercent = metric.unit === '%'
   const status = battery?.connected === true
     ? 'ONLINE'
     : battery?.connected === false
@@ -66,18 +62,10 @@ export default function HistoryBatteryPanel({ index, latest, series, metric, ran
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={series} margin={{ top: 8, right: 12, bottom: 2, left: 0 }}>
               <CartesianGrid stroke="#e7ece9" vertical={false} />
-              <XAxis
-                dataKey="timestamp_ms"
-                tickFormatter={(value) => range === '7d'
-                  ? new Date(value).toLocaleDateString([], { month: 'short', day: 'numeric' })
-                  : new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                minTickGap={34}
-                tick={{ fill: '#74827c', fontSize: 10 }}
-                tickLine={false}
-                axisLine={false}
-              />
+              <XAxis dataKey="timestamp_ms" {...timeAxisProps(startMs, endMs)} />
               <YAxis
                 width={52}
+                domain={isPercent ? [0, 100] : ['auto', 'auto']}
                 tickFormatter={(value) => Number(value).toFixed(metric.decimals)}
                 tick={{ fill: '#74827c', fontSize: 10 }}
                 tickLine={false}
@@ -89,7 +77,8 @@ export default function HistoryBatteryPanel({ index, latest, series, metric, ran
                 contentStyle={{ border: '1px solid #dce3df', borderRadius: 5, fontSize: 12 }}
               />
               <Line
-                type="monotone"
+                type="linear"
+                connectNulls={false}
                 dataKey={dataKey}
                 name={metric.label}
                 stroke={color}

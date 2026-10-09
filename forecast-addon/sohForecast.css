@@ -1,0 +1,19 @@
+/* Styles for SohForecastPanel.jsx. Colors match the dashboard; nothing here changes existing classes. */
+.forecast-addon { display: grid; gap: 12px; padding: 16px; border: 1px solid #dce3df; border-radius: 6px; background: #fff; }
+.forecast-addon-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.forecast-addon-heading h2 { margin: 2px 0 0; font-size: 18px; color: #24332f; }
+.forecast-addon .eyebrow { margin: 0; color: #5f7f72; font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+.forecast-addon-select { display: grid; gap: 4px; color: #718079; font-size: 10px; font-weight: 700; }
+.forecast-addon-select select { min-width: 160px; padding: 8px 9px; border: 1px solid #cfd9d4; border-radius: 5px; font: inherit; font-size: 12px; background: #fff; }
+.forecast-card { display: grid; gap: 12px; margin-top: 14px; padding: 14px; border: 1px solid #e0e7e3; border-left: 3px solid #b06c29; background: #f8faf8; }
+.forecast-card h4 { margin: 0; color: #34463f; font-size: 13px; }
+.forecast-card .forecast-sub { margin: 3px 0 0; color: #718079; font-size: 10px; line-height: 1.45; }
+.forecast-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.forecast-stat { display: grid; gap: 2px; padding: 9px 10px; border: 1px solid #e3e9e5; border-radius: 5px; background: #fff; }
+.forecast-stat span { color: #718079; font-size: 10px; }
+.forecast-stat strong { color: #8c5723; font: 500 15px 'DM Mono', monospace; }
+.forecast-stat small { color: #718079; font-size: 9px; line-height: 1.35; }
+.forecast-chart { width: 100%; height: 230px; }
+.forecast-legend { display: flex; flex-wrap: wrap; gap: 12px; color: #718079; font-size: 10px; }
+.forecast-legend i { display: inline-block; width: 14px; height: 0; margin-right: 5px; vertical-align: middle; border-top: 2px solid; }
+.forecast-empty { color: #7b8982; font-size: 12px; line-height: 1.5; }

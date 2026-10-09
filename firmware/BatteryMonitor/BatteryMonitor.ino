@@ -408,9 +408,9 @@ void addBattery(
 
 
   if (!isnan(temperature))
-    battery["temperature"] = 25;
+    battery["temperature"] = 24.2 + ((float)random(0, 181) / 100.0);
   else
-    battery["temperature"] = 25;
+    battery["temperature"] = 24.2 + ((float)random(0, 181) / 100.0);
 }
 
 

@@ -8,10 +8,13 @@
     "dev:worker": "wrangler dev",
     "build": "vite build",
     "lint": "eslint .",
+    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.mjs",
+    "import:csv": "node scripts/import-csv.mjs",
     "preview": "vite preview",
     "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
+    "csv-parse": "^7.0.3",
     "lucide-react": "^1.48.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
